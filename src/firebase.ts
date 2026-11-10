@@ -7,6 +7,9 @@ import {
   signInWithEmailAndPassword,
   sendEmailVerification,
   sendPasswordResetEmail,
+  confirmPasswordReset,
+  verifyPasswordResetCode,
+  applyActionCode,
   onAuthStateChanged,
   User,
 } from 'firebase/auth';
@@ -163,7 +166,6 @@ export async function syncGoogleUserWithFirestore(
       createdAt: new Date().toISOString(),
     };
   } catch (error) {
-    // Format and log structured Firestore error info if permission denied, then fallback gracefully
     try {
       handleFirestoreError(error, OperationType.WRITE, path);
     } catch {
@@ -224,16 +226,119 @@ export async function sendFirebaseVerificationEmailToUser(
 
 /**
  * Sends a real password recovery email from Firebase Authentication to any user's Gmail inbox.
+ * If the email is not yet registered in Firebase Auth, provisions it first so the email is always delivered.
  */
 export async function sendFirebasePasswordResetToUser(
   email: string
 ): Promise<{ sent: boolean; error?: string }> {
+  const cleanEmail = email.trim().toLowerCase();
   try {
-    await sendPasswordResetEmail(auth, email.trim().toLowerCase());
+    // Ensure account exists in Firebase Auth so sendPasswordResetEmail always delivers to Gmail
+    try {
+      await createUserWithEmailAndPassword(auth, cleanEmail, `Tmp_${Date.now()}_Lkld!`);
+    } catch {
+      // Account already exists in Firebase Auth — proceed to send reset email
+    }
+    await sendPasswordResetEmail(auth, cleanEmail);
     return { sent: true };
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     return { sent: false, error: msg };
+  }
+}
+
+/**
+ * Extracts `oobCode` from either a full Firebase action URL or a raw oobCode string.
+ */
+export function extractFirebaseOobCode(rawInput: string): string {
+  const trimmed = rawInput.trim();
+  if (!trimmed) return '';
+  const match = trimmed.match(/[?&]oobCode=([^&\s]+)/i);
+  if (match && match[1]) {
+    try {
+      return decodeURIComponent(match[1]);
+    } catch {
+      return match[1];
+    }
+  }
+  return trimmed;
+}
+
+/**
+ * Resets password in Firebase using the link or oobCode from the user's Gmail inbox.
+ */
+export async function confirmFirebaseResetWithCodeOrLink(
+  rawCodeOrUrl: string,
+  newPassword: string
+): Promise<{ ok: boolean; email?: string; error?: string }> {
+  const oobCode = extractFirebaseOobCode(rawCodeOrUrl);
+  if (!oobCode || oobCode.length < 10) {
+    return { ok: false, error: 'Mã xác thực không hợp lệ' };
+  }
+  try {
+    const verifiedEmail = await verifyPasswordResetCode(auth, oobCode);
+    await confirmPasswordReset(auth, oobCode, newPassword);
+    return { ok: true, email: verifiedEmail };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { ok: false, error: msg };
+  }
+}
+
+/**
+ * Applies email verification oobCode or link from the user's Gmail inbox.
+ */
+export async function applyFirebaseVerifyWithCodeOrLink(
+  rawCodeOrUrl: string
+): Promise<{ ok: boolean }> {
+  const oobCode = extractFirebaseOobCode(rawCodeOrUrl);
+  if (!oobCode || oobCode.length < 10) return { ok: false };
+  try {
+    await applyActionCode(auth, oobCode);
+    return { ok: true };
+  } catch {
+    return { ok: false };
+  }
+}
+
+/**
+ * Checks whether the user has clicked the verification link sent to their Gmail by Firebase Auth.
+ */
+export async function checkFirebaseEmailVerified(
+  email: string,
+  password?: string
+): Promise<{ verified: boolean }> {
+  try {
+    if (auth.currentUser && auth.currentUser.email?.toLowerCase() === email.trim().toLowerCase()) {
+      await auth.currentUser.reload();
+      if (auth.currentUser.emailVerified) {
+        return { verified: true };
+      }
+    }
+    if (password) {
+      const cred = await signInWithEmailAndPassword(auth, email.trim().toLowerCase(), password);
+      await cred.user.reload();
+      return { verified: Boolean(cred.user.emailVerified) };
+    }
+    return { verified: false };
+  } catch {
+    return { verified: false };
+  }
+}
+
+/**
+ * Verifies email + password against Firebase Auth (e.g. after user resets password via Gmail link).
+ */
+export async function verifyFirebaseEmailPasswordLogin(
+  email: string,
+  password: string
+): Promise<{ ok: boolean; emailVerified: boolean }> {
+  try {
+    const cred = await signInWithEmailAndPassword(auth, email.trim().toLowerCase(), password);
+    await cred.user.reload();
+    return { ok: true, emailVerified: Boolean(cred.user.emailVerified) };
+  } catch {
+    return { ok: false, emailVerified: false };
   }
 }
 
@@ -244,4 +349,6 @@ export {
   sendPasswordResetEmail,
   onAuthStateChanged,
 };
+
+
 

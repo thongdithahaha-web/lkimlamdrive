@@ -1,4 +1,5 @@
 import express from 'express';
+import crypto from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import nodemailer from 'nodemailer';
@@ -97,15 +98,29 @@ function getClientIp(req: express.Request): string {
 }
 
 // ============================================================================
-// Gmail OTP Verification & Password Recovery State
+// Gmail OTP Verification, Password Recovery & Anti-Brute-Force State
 // ============================================================================
+const OTP_HMAC_SECRET = process.env.OTP_HMAC_SECRET || 'lkimlamdrive_vip_hmac_secret_2026_anti_bruteforce';
+const MAX_OTP_ATTEMPTS = 3;
+const MAX_LOGIN_ATTEMPTS = 5;
+const BRUTE_FORCE_LOCKOUT_MS = 15 * 60 * 1000; // 15 minutes
+const OTP_RESEND_COOLDOWN_MS = 60 * 1000; // 60 seconds
+
 interface OtpSession {
   email: string;
   username: string;
   code: string;
   purpose: 'register' | 'reset-password';
   expiresAt: number;
+  lastSentAt: number;
+  failedAttempts: number;
   verified: boolean;
+}
+
+interface BruteForceTracker {
+  failedCount: number;
+  lockedUntilMs: number;
+  lastAttemptMs: number;
 }
 
 export interface SentEmailRecord {
@@ -120,11 +135,39 @@ export interface SentEmailRecord {
 }
 
 const otpStore = new Map<string, OtpSession>();
+const otpBruteForceLockouts = new Map<string, BruteForceTracker>();
+const loginBruteForceLockouts = new Map<string, BruteForceTracker>();
 const sentEmailsOutbox: SentEmailRecord[] = [];
 let runtimeSmtpConfig = {
   smtpEmail: process.env.GMAIL_USER || '',
   smtpAppPassword: process.env.GMAIL_APP_PASSWORD || '',
 };
+
+function createSignedOtpToken(purpose: string, email: string, code: string, expiresAt: number): string {
+  const sig = crypto
+    .createHmac('sha256', OTP_HMAC_SECRET)
+    .update(`${purpose}:${email}:${code}:${expiresAt}`)
+    .digest('hex');
+  return `${expiresAt}.${sig}`;
+}
+
+function verifySignedOtpToken(
+  token: string,
+  purpose: string,
+  email: string,
+  candidateCode: string
+): { valid: boolean; expired: boolean } {
+  if (!token || !token.includes('.')) return { valid: false, expired: false };
+  const [expStr, sig] = token.split('.');
+  const expiresAt = Number(expStr);
+  if (!expiresAt || Number.isNaN(expiresAt)) return { valid: false, expired: false };
+  if (Date.now() > expiresAt) return { valid: false, expired: true };
+  const expectedSig = crypto
+    .createHmac('sha256', OTP_HMAC_SECRET)
+    .update(`${purpose}:${email}:${candidateCode}:${expiresAt}`)
+    .digest('hex');
+  return { valid: sig === expectedSig, expired: false };
+}
 
 async function dispatchGmailVerificationEmail(params: {
   to: string;
@@ -397,12 +440,39 @@ app.use((req, res, next) => {
   // ============================================================================
   app.post('/api/auth/send-verification', async (req, res) => {
     try {
-      const { email, username, smtpEmail, smtpAppPassword, clientOtpCode } = req.body || {};
+      const { email, username, smtpEmail, smtpAppPassword } = req.body || {};
       const cleanEmail = String(email || '').trim().toLowerCase();
       const cleanUsername = String(username || '').trim();
+      const ip = getClientIp(req);
+      const nowMs = Date.now();
 
       if (!cleanEmail || !cleanEmail.includes('@')) {
         res.status(400).json({ error: 'Địa chỉ Gmail không hợp lệ' });
+        return;
+      }
+
+      // Check Brute-Force Lockout on this email or IP
+      const emailLock = otpBruteForceLockouts.get(cleanEmail);
+      const ipLock = otpBruteForceLockouts.get(`ip:${ip}`);
+      const activeLockUntil = Math.max(emailLock?.lockedUntilMs || 0, ipLock?.lockedUntilMs || 0);
+      if (activeLockUntil > nowMs) {
+        const waitSec = Math.ceil((activeLockUntil - nowMs) / 1000);
+        res.status(429).json({
+          error: `[Chống Brute-Force] Địa chỉ Gmail hoặc IP này đang bị tạm khóa ${waitSec} giây do nhập sai OTP quá ${MAX_OTP_ATTEMPTS} lần.`,
+          lockedOut: true,
+          retryAfterSeconds: waitSec,
+        });
+        return;
+      }
+
+      // Check 60s Resend Cooldown to prevent Email Bombing
+      const existingSession = otpStore.get(`register:${cleanEmail}`);
+      if (existingSession && nowMs - existingSession.lastSentAt < OTP_RESEND_COOLDOWN_MS) {
+        const waitSec = Math.ceil((OTP_RESEND_COOLDOWN_MS - (nowMs - existingSession.lastSentAt)) / 1000);
+        res.status(429).json({
+          error: `Vui lòng đợi ${waitSec} giây trước khi yêu cầu gửi lại mã xác thực tới Gmail.`,
+          cooldownSeconds: waitSec,
+        });
         return;
       }
 
@@ -410,17 +480,17 @@ app.use((req, res, next) => {
         runtimeSmtpConfig = { smtpEmail: String(smtpEmail), smtpAppPassword: String(smtpAppPassword) };
       }
 
-      const code =
-        typeof clientOtpCode === 'string' && /^\d{6}$/.test(clientOtpCode)
-          ? clientOtpCode
-          : String(Math.floor(100000 + Math.random() * 900000));
+      const code = String(Math.floor(100000 + Math.random() * 900000));
+      const expiresAt = nowMs + 10 * 60 * 1000;
 
       otpStore.set(`register:${cleanEmail}`, {
         email: cleanEmail,
         username: cleanUsername || cleanEmail.split('@')[0],
         code,
         purpose: 'register',
-        expiresAt: Date.now() + 10 * 60 * 1000,
+        expiresAt,
+        lastSentAt: nowMs,
+        failedAttempts: 0,
         verified: false,
       });
 
@@ -431,14 +501,18 @@ app.use((req, res, next) => {
         purpose: 'register',
       });
 
+      const otpToken = createSignedOtpToken('register', cleanEmail, code, expiresAt);
+
+      // NEVER return the OTP code in the API response!
       res.json({
         success: true,
         sentViaSmtp: mailRes.sentViaSmtp,
         email: cleanEmail,
-        demoOtpCode: code,
-        message: mailRes.sentViaSmtp
-          ? `Đã gửi mã xác nhận 6 số tới hộp thư Gmail ${cleanEmail}.`
-          : `Đã phát hành email xác nhận tới ${cleanEmail} (Mã OTP: ${code}).`,
+        otpToken,
+        maxAttempts: MAX_OTP_ATTEMPTS,
+        remainingAttempts: MAX_OTP_ATTEMPTS,
+        cooldownSeconds: 60,
+        message: `Đã gửi email xác thực tới hộp thư Gmail ${cleanEmail}. Mã xác thực chỉ nằm trong Gmail của bạn (Tối đa ${MAX_OTP_ATTEMPTS} lần thử).`,
       });
     } catch (err) {
       console.error('send-verification error:', err);
@@ -447,37 +521,133 @@ app.use((req, res, next) => {
   });
 
   app.post('/api/auth/verify-otp', (req, res) => {
-    const { email, code, purpose = 'register', expectedCode } = req.body || {};
+    const { email, code, purpose = 'register', otpToken } = req.body || {};
     const cleanEmail = String(email || '').trim().toLowerCase();
     const cleanCode = String(code || '').trim();
-    const key = `${purpose}:${cleanEmail}`;
+    const cleanPurpose = purpose === 'reset-password' ? 'reset-password' : 'register';
+    const key = `${cleanPurpose}:${cleanEmail}`;
+    const ip = getClientIp(req);
+    const nowMs = Date.now();
+
+    // 1. Check active Brute-Force Lockout
+    const emailLock = otpBruteForceLockouts.get(cleanEmail) || {
+      failedCount: 0,
+      lockedUntilMs: 0,
+      lastAttemptMs: nowMs,
+    };
+    const ipLock = otpBruteForceLockouts.get(`ip:${ip}`) || {
+      failedCount: 0,
+      lockedUntilMs: 0,
+      lastAttemptMs: nowMs,
+    };
+
+    const activeLockUntil = Math.max(emailLock.lockedUntilMs, ipLock.lockedUntilMs);
+    if (activeLockUntil > nowMs) {
+      const waitSec = Math.ceil((activeLockUntil - nowMs) / 1000);
+      res.status(429).json({
+        error: `[Chống Brute-Force] Quá giới hạn ${MAX_OTP_ATTEMPTS} lần thử! Tạm khóa xác thực trong ${waitSec} giây.`,
+        lockedOut: true,
+        retryAfterSeconds: waitSec,
+        remainingAttempts: 0,
+      });
+      return;
+    }
 
     const session = otpStore.get(key);
-    if (!session) {
-      // Stateless Serverless fallback (e.g. when Vercel routes verify-otp to a different instance)
-      if (typeof expectedCode === 'string' && /^\d{6}$/.test(expectedCode) && cleanCode === expectedCode) {
-        res.json({
-          success: true,
-          email: cleanEmail,
-          message: 'Xác thực Gmail thành công!',
+    let isCodeMatch = false;
+
+    if (session) {
+      if (nowMs > session.expiresAt) {
+        otpStore.delete(key);
+        res.status(400).json({
+          error: 'Mã xác thực OTP đã hết hạn (quá 10 phút). Vui lòng yêu cầu gửi mã mới vào Gmail.',
         });
         return;
       }
-      res.status(400).json({ error: 'Không tìm thấy yêu cầu xác thực hoặc mã đã hết hạn. Vui lòng gửi lại mã.' });
-      return;
-    }
-    if (Date.now() > session.expiresAt) {
-      otpStore.delete(key);
-      res.status(400).json({ error: 'Mã xác thực OTP đã hết hạn (quá 10 phút). Vui lòng yêu cầu mã mới.' });
-      return;
-    }
-    if (session.code !== cleanCode) {
-      res.status(400).json({ error: 'Mã xác nhận OTP không chính xác. Vui lòng kiểm tra lại hộp thư Gmail.' });
+      isCodeMatch = session.code === cleanCode;
+    } else if (typeof otpToken === 'string' && otpToken.includes('.')) {
+      // Stateless Serverless verification via HMAC-SHA256 signature
+      const tokenCheck = verifySignedOtpToken(otpToken, cleanPurpose, cleanEmail, cleanCode);
+      if (tokenCheck.expired) {
+        res.status(400).json({
+          error: 'Mã xác thực OTP đã hết hạn (quá 10 phút). Vui lòng yêu cầu gửi mã mới vào Gmail.',
+        });
+        return;
+      }
+      isCodeMatch = tokenCheck.valid;
+    } else {
+      res.status(400).json({
+        error: 'Phiên xác thực không tồn tại hoặc đã bị hủy. Vui lòng gửi lại email xác thực.',
+      });
       return;
     }
 
-    session.verified = true;
-    otpStore.set(key, session);
+    if (!isCodeMatch) {
+      // Increment brute-force counters
+      const currentFailed = (session ? session.failedAttempts : emailLock.failedCount) + 1;
+      if (session) {
+        session.failedAttempts = currentFailed;
+        otpStore.set(key, session);
+      }
+
+      emailLock.failedCount = currentFailed;
+      emailLock.lastAttemptMs = nowMs;
+      ipLock.failedCount += 1;
+      ipLock.lastAttemptMs = nowMs;
+
+      const remaining = Math.max(0, MAX_OTP_ATTEMPTS - currentFailed);
+
+      if (currentFailed >= MAX_OTP_ATTEMPTS) {
+        // Destroy OTP immediately so it can never be brute-forced
+        otpStore.delete(key);
+        emailLock.lockedUntilMs = nowMs + BRUTE_FORCE_LOCKOUT_MS;
+        ipLock.lockedUntilMs = nowMs + BRUTE_FORCE_LOCKOUT_MS;
+        otpBruteForceLockouts.set(cleanEmail, emailLock);
+        otpBruteForceLockouts.set(`ip:${ip}`, ipLock);
+
+        recordSecurityEvent(
+          ip,
+          'POST',
+          '/api/auth/verify-otp',
+          `[Brute-Force OTP] Nhập sai mã OTP ${MAX_OTP_ATTEMPTS}/${MAX_OTP_ATTEMPTS} lần liên tiếp cho ${cleanEmail} — Đã hủy mã OTP & Khóa 15 phút`,
+          'Auto-Jail',
+          'auto-banned'
+        );
+
+        res.status(429).json({
+          error: `[Chống Brute-Force Attack] Bạn đã nhập sai quá ${MAX_OTP_ATTEMPTS} lần! Mã OTP đã bị hủy ngay lập tức và tài khoản bị khóa xác thực 15 phút.`,
+          lockedOut: true,
+          retryAfterSeconds: Math.ceil(BRUTE_FORCE_LOCKOUT_MS / 1000),
+          remainingAttempts: 0,
+        });
+        return;
+      }
+
+      otpBruteForceLockouts.set(cleanEmail, emailLock);
+      otpBruteForceLockouts.set(`ip:${ip}`, ipLock);
+
+      recordSecurityEvent(
+        ip,
+        'POST',
+        '/api/auth/verify-otp',
+        `[Cảnh báo Brute-Force OTP] Nhập sai OTP cho ${cleanEmail} (Lần ${currentFailed}/${MAX_OTP_ATTEMPTS})`,
+        'L7-RateLimit',
+        'throttled-429'
+      );
+
+      res.status(400).json({
+        error: `Mã OTP không chính xác! Bạn chỉ còn ${remaining}/${MAX_OTP_ATTEMPTS} lần thử trước khi mã bị hủy và khóa 15 phút.`,
+        remainingAttempts: remaining,
+        lockedOut: false,
+      });
+      return;
+    }
+
+    // Success: reset brute-force counters & consume OTP
+    otpStore.delete(key);
+    otpBruteForceLockouts.delete(cleanEmail);
+    otpBruteForceLockouts.delete(`ip:${ip}`);
+
     res.json({
       success: true,
       email: cleanEmail,
@@ -487,10 +657,38 @@ app.use((req, res, next) => {
 
   app.post('/api/auth/forgot-password', async (req, res) => {
     try {
-      const { email, username, smtpEmail, smtpAppPassword, clientOtpCode } = req.body || {};
+      const { email, username, smtpEmail, smtpAppPassword } = req.body || {};
       const cleanEmail = String(email || '').trim().toLowerCase();
+      const ip = getClientIp(req);
+      const nowMs = Date.now();
+
       if (!cleanEmail || !cleanEmail.includes('@')) {
         res.status(400).json({ error: 'Vui lòng nhập đúng địa chỉ Gmail đã đăng ký' });
+        return;
+      }
+
+      // Check Brute-Force Lockout
+      const emailLock = otpBruteForceLockouts.get(cleanEmail);
+      const ipLock = otpBruteForceLockouts.get(`ip:${ip}`);
+      const activeLockUntil = Math.max(emailLock?.lockedUntilMs || 0, ipLock?.lockedUntilMs || 0);
+      if (activeLockUntil > nowMs) {
+        const waitSec = Math.ceil((activeLockUntil - nowMs) / 1000);
+        res.status(429).json({
+          error: `[Chống Brute-Force] Yêu cầu khôi phục cho Gmail này đang tạm khóa ${waitSec} giây do thử sai quá nhiều lần.`,
+          lockedOut: true,
+          retryAfterSeconds: waitSec,
+        });
+        return;
+      }
+
+      // Check 60s Resend Cooldown
+      const existingSession = otpStore.get(`reset-password:${cleanEmail}`);
+      if (existingSession && nowMs - existingSession.lastSentAt < OTP_RESEND_COOLDOWN_MS) {
+        const waitSec = Math.ceil((OTP_RESEND_COOLDOWN_MS - (nowMs - existingSession.lastSentAt)) / 1000);
+        res.status(429).json({
+          error: `Vui lòng đợi ${waitSec} giây trước khi gửi lại email khôi phục mật khẩu.`,
+          cooldownSeconds: waitSec,
+        });
         return;
       }
 
@@ -498,17 +696,17 @@ app.use((req, res, next) => {
         runtimeSmtpConfig = { smtpEmail: String(smtpEmail), smtpAppPassword: String(smtpAppPassword) };
       }
 
-      const code =
-        typeof clientOtpCode === 'string' && /^\d{6}$/.test(clientOtpCode)
-          ? clientOtpCode
-          : String(Math.floor(100000 + Math.random() * 900000));
+      const code = String(Math.floor(100000 + Math.random() * 900000));
+      const expiresAt = nowMs + 10 * 60 * 1000;
 
       otpStore.set(`reset-password:${cleanEmail}`, {
         email: cleanEmail,
         username: String(username || cleanEmail.split('@')[0]),
         code,
         purpose: 'reset-password',
-        expiresAt: Date.now() + 10 * 60 * 1000,
+        expiresAt,
+        lastSentAt: nowMs,
+        failedAttempts: 0,
         verified: false,
       });
 
@@ -519,19 +717,98 @@ app.use((req, res, next) => {
         purpose: 'reset-password',
       });
 
+      const otpToken = createSignedOtpToken('reset-password', cleanEmail, code, expiresAt);
+
+      // NEVER return the OTP code in the API response!
       res.json({
         success: true,
         sentViaSmtp: mailRes.sentViaSmtp,
         email: cleanEmail,
-        demoOtpCode: code,
-        message: mailRes.sentViaSmtp
-          ? `Đã gửi mã khôi phục mật khẩu 6 số tới Gmail ${cleanEmail}.`
-          : `Đã gửi mã khôi phục mật khẩu tới ${cleanEmail} (Mã OTP: ${code}).`,
+        otpToken,
+        maxAttempts: MAX_OTP_ATTEMPTS,
+        remainingAttempts: MAX_OTP_ATTEMPTS,
+        cooldownSeconds: 60,
+        message: `Đã gửi thư khôi phục mật khẩu tới hộp thư Gmail ${cleanEmail}. Vui lòng mở Gmail của bạn (Tối đa ${MAX_OTP_ATTEMPTS} lần thử).`,
       });
     } catch (err) {
       console.error('forgot-password error:', err);
-      res.status(500).json({ error: 'Không thể gửi mã khôi phục mật khẩu' });
+      res.status(500).json({ error: 'Không thể gửi email khôi phục mật khẩu' });
     }
+  });
+
+  // Anti-Brute-Force Login Guard Endpoint (Max 5 failed login attempts -> 15m lockout)
+  app.post('/api/auth/login-guard', (req, res) => {
+    const { identifier, outcome } = req.body || {};
+    const cleanId = String(identifier || '').trim().toLowerCase() || 'unknown';
+    const ip = getClientIp(req);
+    const nowMs = Date.now();
+    const key = `login:${cleanId}:${ip}`;
+
+    const tracker = loginBruteForceLockouts.get(key) || {
+      failedCount: 0,
+      lockedUntilMs: 0,
+      lastAttemptMs: nowMs,
+    };
+
+    if (tracker.lockedUntilMs > nowMs) {
+      const waitSec = Math.ceil((tracker.lockedUntilMs - nowMs) / 1000);
+      res.status(429).json({
+        allowed: false,
+        lockedOut: true,
+        retryAfterSeconds: waitSec,
+        remainingAttempts: 0,
+        error: `[Chống Brute-Force] Tài khoản tạm khóa đăng nhập trong ${waitSec} giây do nhập sai mật khẩu quá ${MAX_LOGIN_ATTEMPTS} lần.`,
+      });
+      return;
+    }
+
+    if (outcome === 'success') {
+      loginBruteForceLockouts.delete(key);
+      res.json({ allowed: true, remainingAttempts: MAX_LOGIN_ATTEMPTS });
+      return;
+    }
+
+    if (outcome === 'failed') {
+      tracker.failedCount += 1;
+      tracker.lastAttemptMs = nowMs;
+      const remaining = Math.max(0, MAX_LOGIN_ATTEMPTS - tracker.failedCount);
+
+      if (tracker.failedCount >= MAX_LOGIN_ATTEMPTS) {
+        tracker.lockedUntilMs = nowMs + BRUTE_FORCE_LOCKOUT_MS;
+        loginBruteForceLockouts.set(key, tracker);
+        recordSecurityEvent(
+          ip,
+          'POST',
+          '/api/auth/login',
+          `[Brute-Force Login] Đăng nhập sai mật khẩu ${MAX_LOGIN_ATTEMPTS}/${MAX_LOGIN_ATTEMPTS} lần liên tiếp (${cleanId}) — Khóa 15 phút`,
+          'Auto-Jail',
+          'auto-banned'
+        );
+        res.status(429).json({
+          allowed: false,
+          lockedOut: true,
+          retryAfterSeconds: Math.ceil(BRUTE_FORCE_LOCKOUT_MS / 1000),
+          remainingAttempts: 0,
+          error: `[Chống Brute-Force Attack] Nhập sai mật khẩu ${MAX_LOGIN_ATTEMPTS} lần liên tiếp! Tạm khóa đăng nhập 15 phút.`,
+        });
+        return;
+      }
+
+      loginBruteForceLockouts.set(key, tracker);
+      res.json({
+        allowed: true,
+        lockedOut: false,
+        remainingAttempts: remaining,
+        error: `Sai thông tin đăng nhập! Cảnh báo Brute-Force: Còn ${remaining}/${MAX_LOGIN_ATTEMPTS} lần thử trước khi khóa 15 phút.`,
+      });
+      return;
+    }
+
+    res.json({
+      allowed: true,
+      lockedOut: false,
+      remainingAttempts: Math.max(0, MAX_LOGIN_ATTEMPTS - tracker.failedCount),
+    });
   });
 
   app.get('/api/auth/outbox', (_req, res) => {
