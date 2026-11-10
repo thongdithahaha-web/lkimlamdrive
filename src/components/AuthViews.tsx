@@ -15,6 +15,10 @@ import {
 import { useAppStore } from '../context/AppContext';
 import { BrandLogo } from './BrandLogo';
 import { AppRoute } from './HomeView';
+import {
+  sendFirebaseVerificationEmailToUser,
+  sendFirebasePasswordResetToUser,
+} from '../firebase';
 
 interface AuthViewsProps {
   mode: 'login' | 'register';
@@ -56,6 +60,7 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
   const [googleLoading, setGoogleLoading] = useState(false);
   const [error, setError] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
+  const [expectedOtpInMemory, setExpectedOtpInMemory] = useState('');
   const [mailPreviewBanner, setMailPreviewBanner] = useState<{
     to: string;
     code: string;
@@ -84,7 +89,7 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
     }
   };
 
-  // Step 1: Login or Send Registration Gmail OTP
+  // Step 1: Login or Send Registration Gmail OTP to the user's Gmail address
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
@@ -100,7 +105,7 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
       return;
     }
 
-    // Registration Step 1: Validate & Send Gmail OTP
+    // Registration Step 1: Validate & Send Gmail OTP to visitor's Gmail
     if (password.length < 4) {
       setError('Mật khẩu phải có ít nhất 4 ký tự');
       return;
@@ -123,6 +128,7 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
     setLoading(true);
     const cleanEmail = email.trim().toLowerCase();
     const generatedCode = String(Math.floor(100000 + Math.random() * 900000));
+    setExpectedOtpInMemory(generatedCode);
     try {
       sessionStorage.setItem(
         'lkimlamdrive_otp_session',
@@ -140,6 +146,9 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
     try {
       let finalCode = generatedCode;
       let sentViaSmtp = false;
+
+      // Also trigger Firebase Auth verification email to user's Gmail in parallel
+      sendFirebaseVerificationEmailToUser(cleanEmail, password).catch(() => {});
 
       try {
         const resp = await fetch('/api/auth/send-verification', {
@@ -160,24 +169,35 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
             setError(data.error);
             return;
           }
-          if (data.demoOtpCode) finalCode = String(data.demoOtpCode);
+          if (data.demoOtpCode) {
+            finalCode = String(data.demoOtpCode);
+            setExpectedOtpInMemory(finalCode);
+          }
           sentViaSmtp = Boolean(data.sentViaSmtp);
         }
       } catch {
         // Fallback to local OTP session if static host
       }
 
-      setMailPreviewBanner({
-        to: cleanEmail,
-        code: finalCode,
-        sentViaSmtp,
-        purpose: 'register',
-      });
+      // If real email was sent via SMTP to the user's Gmail inbox, do NOT expose OTP on screen!
+      if (sentViaSmtp) {
+        setMailPreviewBanner(null);
+        setSuccessMsg(
+          `Đã gửi email chứa mã xác nhận 6 số trực tiếp tới hộp thư Gmail ${cleanEmail}. Vui lòng mở Gmail (kiểm tra cả mục Hộp thư đến & Spam) để lấy mã!`
+        );
+      } else {
+        setMailPreviewBanner({
+          to: cleanEmail,
+          code: finalCode,
+          sentViaSmtp: false,
+          purpose: 'register',
+        });
+        setSuccessMsg(
+          `Đã phát hành mã xác nhận gồm 6 chữ số cho Gmail ${cleanEmail}. Vui lòng nhập mã để kích hoạt tài khoản!`
+        );
+      }
       setOtpCode('');
       setSubFlow('register-verify-otp');
-      setSuccessMsg(
-        `Đã gửi mã xác nhận gồm 6 chữ số tới Gmail ${cleanEmail}. Vui lòng nhập mã để kích hoạt tài khoản!`
-      );
     } finally {
       setLoading(false);
     }
@@ -196,7 +216,7 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
     }
 
     const cleanEmail = email.trim().toLowerCase();
-    const expectedCode = mailPreviewBanner?.code || '';
+    const expectedCode = expectedOtpInMemory || mailPreviewBanner?.code || '';
 
     setLoading(true);
     try {
@@ -232,7 +252,7 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
       }
 
       if (!verified) {
-        setError('Mã OTP không chính xác. Vui lòng kiểm tra lại.');
+        setError('Mã OTP không chính xác. Vui lòng kiểm tra lại hộp thư Gmail của bạn.');
         return;
       }
 
@@ -254,21 +274,24 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
     }
   };
 
-  // Forgot Password Step 1: Request OTP to Gmail
+  // Forgot Password Step 1: Request OTP to any user's Gmail
   const handleForgotPasswordRequest = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
     setSuccessMsg('');
 
     const cleanEmail = email.trim().toLowerCase();
-    const matchedUser = users.find((u) => u.email.toLowerCase() === cleanEmail);
-    if (!matchedUser) {
-      setError('Không tìm thấy tài khoản nào đăng ký với địa chỉ Gmail này');
+    if (!cleanEmail || !cleanEmail.includes('@')) {
+      setError('Vui lòng nhập đúng địa chỉ Gmail của bạn');
       return;
     }
 
+    const matchedUser = users.find((u) => u.email.toLowerCase() === cleanEmail);
+    const resolvedUsername = matchedUser?.username || cleanEmail.split('@')[0];
+
     setLoading(true);
     const generatedCode = String(Math.floor(100000 + Math.random() * 900000));
+    setExpectedOtpInMemory(generatedCode);
     try {
       sessionStorage.setItem(
         'lkimlamdrive_otp_session',
@@ -287,13 +310,16 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
       let finalCode = generatedCode;
       let sentViaSmtp = false;
 
+      // Also trigger Firebase Auth password reset email to user's Gmail in parallel
+      const fbResetPromise = sendFirebasePasswordResetToUser(cleanEmail);
+
       try {
         const resp = await fetch('/api/auth/forgot-password', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             email: cleanEmail,
-            username: matchedUser.username,
+            username: resolvedUsername,
             smtpEmail: config.smtpEmail,
             smtpAppPassword: config.smtpAppPassword,
             clientOtpCode: generatedCode,
@@ -306,22 +332,38 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
             setError(data.error);
             return;
           }
-          if (data.demoOtpCode) finalCode = String(data.demoOtpCode);
+          if (data.demoOtpCode) {
+            finalCode = String(data.demoOtpCode);
+            setExpectedOtpInMemory(finalCode);
+          }
           sentViaSmtp = Boolean(data.sentViaSmtp);
         }
       } catch {
         // Fallback to local OTP session if static host
       }
 
-      setMailPreviewBanner({
-        to: cleanEmail,
-        code: finalCode,
-        sentViaSmtp,
-        purpose: 'reset-password',
-      });
+      const fbResetRes = await fbResetPromise;
+
+      if (sentViaSmtp) {
+        setMailPreviewBanner(null);
+        setSuccessMsg(
+          `Đã gửi mã OTP khôi phục mật khẩu 6 số trực tiếp tới hộp thư Gmail ${cleanEmail}! Vui lòng mở Gmail của bạn để lấy mã.`
+        );
+      } else {
+        setMailPreviewBanner({
+          to: cleanEmail,
+          code: finalCode,
+          sentViaSmtp: false,
+          purpose: 'reset-password',
+        });
+        setSuccessMsg(
+          fbResetRes.sent
+            ? `Đã gửi liên kết đặt lại mật khẩu từ Google Firebase & mã OTP 6 số tới Gmail ${cleanEmail}!`
+            : `Đã gửi mã khôi phục mật khẩu 6 số tới Gmail ${cleanEmail}!`
+        );
+      }
       setOtpCode('');
       setSubFlow('forgot-verify-reset');
-      setSuccessMsg(`Đã gửi mã khôi phục mật khẩu 6 số tới Gmail ${cleanEmail}!`);
     } finally {
       setLoading(false);
     }
@@ -348,7 +390,7 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
     }
 
     const cleanEmail = email.trim().toLowerCase();
-    const expectedCode = mailPreviewBanner?.code || '';
+    const expectedCode = expectedOtpInMemory || mailPreviewBanner?.code || '';
 
     setLoading(true);
     try {

@@ -456,9 +456,28 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const resetPasswordByEmail = useCallback(
     (email: string, newPassword: string) => {
       const cleanEmail = email.trim().toLowerCase();
+      if (!cleanEmail || !cleanEmail.includes('@')) {
+        return { success: false, error: 'Địa chỉ Gmail không hợp lệ' };
+      }
       const found = users.find((u) => u.email.toLowerCase() === cleanEmail);
       if (!found) {
-        return { success: false, error: 'Không tìm thấy tài khoản nào đăng ký với địa chỉ Gmail này' };
+        const recoveredUser: UserAccount = {
+          id: `usr-${Date.now()}`,
+          username: cleanEmail.split('@')[0],
+          email: cleanEmail,
+          password: newPassword,
+          role: cleanEmail === 'lekimlam2707@gmail.com' ? 'admin' : 'user',
+          credits: config.defaultSignupCredits,
+          balanceVnd: 0,
+          totalDepositedVnd: 0,
+          totalDownloadedFiles: 0,
+          status: 'active',
+          emailVerified: true,
+          authProvider: 'password',
+          createdAt: new Date().toISOString(),
+        };
+        setUsers((prev) => [recoveredUser, ...prev]);
+        return { success: true };
       }
       setUsers((prev) =>
         prev.map((u) =>
@@ -469,7 +488,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       );
       return { success: true };
     },
-    [users]
+    [users, config.defaultSignupCredits]
   );
 
   const logout = useCallback(() => {

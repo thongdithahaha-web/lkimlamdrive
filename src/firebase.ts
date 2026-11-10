@@ -3,6 +3,8 @@ import {
   getAuth,
   GoogleAuthProvider,
   signInWithPopup,
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
   sendEmailVerification,
   sendPasswordResetEmail,
   onAuthStateChanged,
@@ -191,4 +193,55 @@ export async function signInWithGooglePopup(
   return syncGoogleUserWithFirestore(result.user, defaultSignupCredits);
 }
 
-export { sendEmailVerification, sendPasswordResetEmail, onAuthStateChanged };
+/**
+ * Registers or signs in a user with Firebase Email/Password Auth and triggers Google's
+ * built-in verification email to that user's Gmail address.
+ */
+export async function sendFirebaseVerificationEmailToUser(
+  email: string,
+  password: string
+): Promise<{ sent: boolean; error?: string }> {
+  try {
+    const cred = await createUserWithEmailAndPassword(auth, email.trim().toLowerCase(), password);
+    await sendEmailVerification(cred.user);
+    return { sent: true };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes('auth/email-already-in-use')) {
+      try {
+        const cred = await signInWithEmailAndPassword(auth, email.trim().toLowerCase(), password);
+        if (!cred.user.emailVerified) {
+          await sendEmailVerification(cred.user);
+          return { sent: true };
+        }
+      } catch {
+        // ignore
+      }
+    }
+    return { sent: false, error: msg };
+  }
+}
+
+/**
+ * Sends a real password recovery email from Firebase Authentication to any user's Gmail inbox.
+ */
+export async function sendFirebasePasswordResetToUser(
+  email: string
+): Promise<{ sent: boolean; error?: string }> {
+  try {
+    await sendPasswordResetEmail(auth, email.trim().toLowerCase());
+    return { sent: true };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { sent: false, error: msg };
+  }
+}
+
+export {
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
+  sendEmailVerification,
+  sendPasswordResetEmail,
+  onAuthStateChanged,
+};
+
