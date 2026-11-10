@@ -57,6 +57,7 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [otpCode, setOtpCode] = useState('');
+  const [gmailLink, setGmailLink] = useState('');
   const [otpToken, setOtpToken] = useState('');
   const [newResetPassword, setNewResetPassword] = useState('');
   const [confirmResetPassword, setConfirmResetPassword] = useState('');
@@ -237,9 +238,7 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
     const cleanEmail = email.trim().toLowerCase();
 
     try {
-      const fbMailPromise = sendFirebaseVerificationEmailToUser(cleanEmail, password);
-
-      let serverLocked = false;
+      let serverDispatched = false;
       try {
         const resp = await fetch('/api/auth/send-verification', {
           method: 'POST',
@@ -247,6 +246,7 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
           body: JSON.stringify({
             username: username.trim(),
             email: cleanEmail,
+            password,
             smtpEmail: config.smtpEmail,
             smtpAppPassword: config.smtpAppPassword,
           }),
@@ -255,7 +255,6 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
         if (contentType.includes('application/json')) {
           const data = await resp.json();
           if (resp.status === 429) {
-            serverLocked = true;
             if (data.lockedOut && data.retryAfterSeconds) {
               setLockoutSeconds(Number(data.retryAfterSeconds));
               setRemainingOtpAttempts(0);
@@ -272,17 +271,22 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
           if (data.otpToken) {
             setOtpToken(String(data.otpToken));
           }
+          if (resp.ok && data.success) {
+            serverDispatched = true;
+          }
         }
       } catch {
-        // continue
+        // fallback below if backend unreachable
       }
 
-      if (serverLocked) return;
-      await fbMailPromise;
+      if (!serverDispatched) {
+        await sendFirebaseVerificationEmailToUser(cleanEmail, password);
+      }
 
       setRemainingOtpAttempts(MAX_OTP_ATTEMPTS);
       setResendCooldownSec(60);
       setOtpCode('');
+      setGmailLink('');
       setSubFlow('register-verify-otp');
       setSuccessMsg(`Đã gửi tới Gmail: ${cleanEmail}`);
     } finally {
@@ -296,10 +300,11 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
     if (nextRem <= 0) {
       setLockoutSeconds(LOCKOUT_DURATION_SEC);
       setOtpCode('');
+      setGmailLink('');
       setError(`Sai quá ${MAX_OTP_ATTEMPTS} lần! Đã hủy mã & khóa 15 phút.`);
       return;
     }
-    setError(`${customMsg || 'Mã hoặc trạng thái xác thực chưa đúng'} (Còn ${nextRem}/${MAX_OTP_ATTEMPTS} lần)`);
+    setError(`${customMsg || 'Mã hoặc link xác thực chưa đúng'} (Còn ${nextRem}/${MAX_OTP_ATTEMPTS} lần)`);
   };
 
   const handleCheckFirebaseGmailVerified = async () => {
@@ -327,43 +332,28 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
     }
   };
 
+  // Separate Handler 1A: Verify Registration by 6-digit OTP Code
   const handleVerifyRegistrationOtp = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
     setSuccessMsg('');
     if (lockoutSeconds > 0) return;
 
-    const rawInput = otpCode.trim();
-    if (!rawInput) {
-      setError('Vui lòng nhập mã hoặc dán link từ Gmail');
+    const cleanCode = otpCode.trim();
+    if (!/^\d{6}$/.test(cleanCode)) {
+      setError('Vui lòng nhập đúng mã OTP 6 chữ số');
       return;
     }
 
     const cleanEmail = email.trim().toLowerCase();
     setLoading(true);
     try {
-      // Support pasting Firebase verification link or oobCode from Gmail
-      if (rawInput.length > 6) {
-        const fbVerify = await applyFirebaseVerifyWithCodeOrLink(rawInput);
-        if (fbVerify.ok) {
-          const regRes = register(username, email, password);
-          if (!regRes.success) {
-            setError(regRes.error || 'Đăng ký thất bại');
-            return;
-          }
-          onNavigate('home');
-          return;
-        }
-        penalizeFailedOtpAttempt('Link / Mã xác thực không đúng');
-        return;
-      }
-
       const resp = await fetch('/api/auth/verify-otp', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           email: cleanEmail,
-          code: rawInput,
+          code: cleanCode,
           purpose: 'register',
           otpToken,
         }),
@@ -371,7 +361,7 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
 
       const contentType = resp.headers.get('content-type') || '';
       if (!contentType.includes('application/json')) {
-        penalizeFailedOtpAttempt('Mã không hợp lệ');
+        penalizeFailedOtpAttempt('Mã OTP không hợp lệ');
         return;
       }
 
@@ -391,7 +381,7 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
             : Math.max(0, remainingOtpAttempts - 1);
         setRemainingOtpAttempts(nextRem);
         if (nextRem <= 0) setLockoutSeconds(LOCKOUT_DURATION_SEC);
-        setError(`Mã không đúng (Còn ${nextRem}/${MAX_OTP_ATTEMPTS} lần)`);
+        setError(`Mã OTP không đúng (Còn ${nextRem}/${MAX_OTP_ATTEMPTS} lần)`);
         return;
       }
 
@@ -403,6 +393,37 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
       onNavigate('home');
     } catch {
       setError('Lỗi kết nối xác thực');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Separate Handler 1B: Verify Registration by Gmail Link
+  const handleVerifyRegistrationByLink = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError('');
+    setSuccessMsg('');
+    if (lockoutSeconds > 0) return;
+
+    const cleanLink = gmailLink.trim();
+    if (!cleanLink) {
+      setError('Vui lòng dán đường link từ Gmail');
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const fbVerify = await applyFirebaseVerifyWithCodeOrLink(cleanLink);
+      if (!fbVerify.ok) {
+        penalizeFailedOtpAttempt('Link xác thực không hợp lệ hoặc đã hết hạn');
+        return;
+      }
+      const regRes = register(username, email, password);
+      if (!regRes.success) {
+        setError(regRes.error || 'Đăng ký thất bại');
+        return;
+      }
+      onNavigate('home');
     } finally {
       setLoading(false);
     }
@@ -426,8 +447,7 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
 
     setLoading(true);
     try {
-      const fbResetPromise = sendFirebasePasswordResetToUser(cleanEmail);
-
+      let serverDispatched = false;
       try {
         const resp = await fetch('/api/auth/forgot-password', {
           method: 'POST',
@@ -435,6 +455,7 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
           body: JSON.stringify({
             email: cleanEmail,
             username: resolvedUsername,
+            userPassword: matchedUser?.password,
             smtpEmail: config.smtpEmail,
             smtpAppPassword: config.smtpAppPassword,
           }),
@@ -459,16 +480,22 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
           if (data.otpToken) {
             setOtpToken(String(data.otpToken));
           }
+          if (resp.ok && data.success) {
+            serverDispatched = true;
+          }
         }
       } catch {
-        // continue
+        // fallback below if backend unreachable
       }
 
-      await fbResetPromise;
+      if (!serverDispatched) {
+        await sendFirebasePasswordResetToUser(cleanEmail);
+      }
 
       setRemainingOtpAttempts(MAX_OTP_ATTEMPTS);
       setResendCooldownSec(60);
       setOtpCode('');
+      setGmailLink('');
       setSubFlow('forgot-verify-reset');
       setSuccessMsg(`Đã gửi tới Gmail: ${cleanEmail}`);
     } finally {
@@ -476,15 +503,16 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
     }
   };
 
-  const handleForgotPasswordReset = async (e: React.FormEvent) => {
+  // Separate Handler 2A: Reset Password by 6-digit OTP Code
+  const handleForgotPasswordResetByOtp = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
     setSuccessMsg('');
     if (lockoutSeconds > 0) return;
 
-    const rawInput = otpCode.trim();
-    if (!rawInput) {
-      setError('Vui lòng dán link / mã từ Gmail');
+    const cleanCode = otpCode.trim();
+    if (!/^\d{6}$/.test(cleanCode)) {
+      setError('Vui lòng nhập đúng mã OTP 6 chữ số');
       return;
     }
     if (!newResetPassword || newResetPassword.length < 6) {
@@ -499,31 +527,12 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
     const cleanEmail = email.trim().toLowerCase();
     setLoading(true);
     try {
-      // 1. If user pasted the Firebase link or oobCode from Gmail (like in image_e622b7ca.png)
-      if (rawInput.length > 6) {
-        const fbConfirm = await confirmFirebaseResetWithCodeOrLink(rawInput, newResetPassword);
-        if (!fbConfirm.ok) {
-          penalizeFailedOtpAttempt('Link / Mã khôi phục không đúng hoặc đã hết hạn');
-          return;
-        }
-        const targetEmail = (fbConfirm.email || cleanEmail).toLowerCase();
-        resetPasswordByEmail(targetEmail, newResetPassword);
-        setSuccessMsg('Đặt lại mật khẩu thành công!');
-        setPassword(newResetPassword);
-        window.setTimeout(() => {
-          setSubFlow('form');
-          onNavigate('login');
-        }, 700);
-        return;
-      }
-
-      // 2. Otherwise verify 6-digit SMTP OTP code
       const resp = await fetch('/api/auth/verify-otp', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           email: cleanEmail,
-          code: rawInput,
+          code: cleanCode,
           purpose: 'reset-password',
           otpToken,
         }),
@@ -531,7 +540,7 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
 
       const contentType = resp.headers.get('content-type') || '';
       if (!contentType.includes('application/json')) {
-        penalizeFailedOtpAttempt('Mã không đúng');
+        penalizeFailedOtpAttempt('Mã OTP không đúng');
         return;
       }
 
@@ -552,7 +561,7 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
             : Math.max(0, remainingOtpAttempts - 1);
         setRemainingOtpAttempts(nextRem);
         if (nextRem <= 0) setLockoutSeconds(LOCKOUT_DURATION_SEC);
-        setError(`Mã không đúng (Còn ${nextRem}/${MAX_OTP_ATTEMPTS} lần)`);
+        setError(`Mã OTP không đúng (Còn ${nextRem}/${MAX_OTP_ATTEMPTS} lần)`);
         return;
       }
 
@@ -569,7 +578,49 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
         onNavigate('login');
       }, 700);
     } catch {
-      setError('Lỗi xác thực mã');
+      setError('Lỗi xác thực mã OTP');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Separate Handler 2B: Reset Password by Gmail Link
+  const handleForgotPasswordResetByLink = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError('');
+    setSuccessMsg('');
+    if (lockoutSeconds > 0) return;
+
+    const cleanLink = gmailLink.trim();
+    if (!cleanLink) {
+      setError('Vui lòng dán đường link từ Gmail');
+      return;
+    }
+    if (!newResetPassword || newResetPassword.length < 6) {
+      setError('Mật khẩu mới tối thiểu 6 ký tự');
+      return;
+    }
+    if (newResetPassword !== confirmResetPassword) {
+      setError('Mật khẩu xác nhận không khớp');
+      return;
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+    setLoading(true);
+    try {
+      const fbConfirm = await confirmFirebaseResetWithCodeOrLink(cleanLink, newResetPassword);
+      if (!fbConfirm.ok) {
+        penalizeFailedOtpAttempt('Link khôi phục không đúng hoặc đã hết hạn');
+        return;
+      }
+      const targetEmail = (fbConfirm.email || cleanEmail).toLowerCase();
+      resetPasswordByEmail(targetEmail, newResetPassword);
+      setSuccessMsg('Đặt lại mật khẩu bằng Link thành công!');
+      setPassword(newResetPassword);
+      window.setTimeout(() => {
+        setSubFlow('form');
+        onNavigate('login');
+      }, 700);
     } finally {
       setLoading(false);
     }
@@ -828,21 +879,24 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
             </>
           )}
 
-          {/* SUBFLOW 2: Concise Registration Verification */}
+          {/* SUBFLOW 2: Registration Verification (Separate OTP 6-digit & Separate Link) */}
           {subFlow === 'register-verify-otp' && (
             <div className="space-y-3.5 relative z-10">
-              <form onSubmit={handleVerifyRegistrationOtp} className="space-y-3">
+              {/* Cách 1: Mã OTP 6 số riêng */}
+              <form onSubmit={handleVerifyRegistrationOtp} className="space-y-2.5">
                 <div className="relative flex items-center overflow-hidden rounded-lg">
                   <KeyRound className="absolute left-3 w-4 h-4 text-emerald-400" />
                   <input
                     type="text"
+                    inputMode="numeric"
+                    maxLength={6}
                     required
                     disabled={lockoutSeconds > 0 || remainingOtpAttempts <= 0}
-                    aria-label="Dán link hoặc mã xác nhận từ Gmail"
-                    placeholder="Dán link hoặc mã OTP trong Gmail"
+                    aria-label="Nhập mã OTP 6 số"
+                    placeholder="Nhập mã OTP 6 số từ Gmail"
                     value={otpCode}
-                    onChange={(e) => setOtpCode(e.target.value)}
-                    className="w-full bg-white/10 border border-white/20 focus:border-emerald-400 rounded-lg text-white placeholder:text-white/40 h-10 text-xs pl-10 pr-3 focus:outline-none disabled:opacity-50"
+                    onChange={(e) => setOtpCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                    className="w-full bg-white/10 border border-white/20 focus:border-emerald-400 rounded-lg text-white placeholder:text-white/40 h-10 text-sm font-mono tracking-widest pl-10 pr-3 focus:outline-none disabled:opacity-50"
                   />
                 </div>
 
@@ -852,19 +906,46 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
                   className="w-full bg-emerald-500 hover:bg-emerald-400 text-black font-semibold h-10 rounded-lg transition-all flex items-center justify-center gap-1.5 text-xs sm:text-sm cursor-pointer disabled:opacity-50"
                 >
                   {loading && <Loader2 className="w-4 h-4 animate-spin" />}
-                  <span>Xác Nhận Mã / Link Gmail</span>
+                  <span>Xác Nhận Mã OTP 6 Số</span>
                 </button>
               </form>
 
-              <button
-                type="button"
-                onClick={handleCheckFirebaseGmailVerified}
-                disabled={loading || lockoutSeconds > 0 || remainingOtpAttempts <= 0}
-                className="w-full bg-white/10 hover:bg-white/20 text-white font-medium h-9 rounded-lg transition-all flex items-center justify-center gap-1.5 text-xs cursor-pointer disabled:opacity-50"
-              >
-                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-                <span>Đã Nhấn Link Trong Gmail → Kích Hoạt</span>
-              </button>
+              <div className="flex items-center gap-2">
+                <div className="h-px bg-white/10 flex-1" />
+                <span className="text-[10px] text-white/40 uppercase">Hoặc dùng Link riêng</span>
+                <div className="h-px bg-white/10 flex-1" />
+              </div>
+
+              {/* Cách 2: Link xác thực riêng */}
+              <form onSubmit={handleVerifyRegistrationByLink} className="space-y-2">
+                <input
+                  type="text"
+                  disabled={lockoutSeconds > 0 || remainingOtpAttempts <= 0}
+                  aria-label="Dán đường link từ Gmail"
+                  placeholder="Dán đường link xác thực từ Gmail..."
+                  value={gmailLink}
+                  onChange={(e) => setGmailLink(e.target.value)}
+                  className="w-full bg-white/5 border border-white/15 focus:border-indigo-400 rounded-lg text-white placeholder:text-white/35 h-9 text-xs px-3 focus:outline-none disabled:opacity-50"
+                />
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="submit"
+                    disabled={loading || lockoutSeconds > 0 || remainingOtpAttempts <= 0}
+                    className="bg-indigo-500 hover:bg-indigo-400 text-white font-medium h-9 rounded-lg text-xs cursor-pointer disabled:opacity-50"
+                  >
+                    Xác Nhận Link
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleCheckFirebaseGmailVerified}
+                    disabled={loading || lockoutSeconds > 0 || remainingOtpAttempts <= 0}
+                    className="bg-white/10 hover:bg-white/20 text-white font-medium h-9 rounded-lg flex items-center justify-center gap-1 text-xs cursor-pointer disabled:opacity-50"
+                  >
+                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                    <span>Đã Nhấn Link</span>
+                  </button>
+                </div>
+              </form>
 
               <div className="flex items-center justify-between text-xs pt-1">
                 <button
@@ -917,7 +998,7 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
               >
                 {loading && <Loader2 className="w-4 h-4 animate-spin" />}
                 <span>
-                  {resendCooldownSec > 0 ? `Đợi ${resendCooldownSec}s` : 'Gửi Mã Khôi Phục'}
+                  {resendCooldownSec > 0 ? `Đợi ${resendCooldownSec}s` : 'Gửi Mã & Link Khôi Phục'}
                 </span>
                 <ArrowRight className="w-3.5 h-3.5" />
               </button>
@@ -936,24 +1017,11 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
             </form>
           )}
 
-          {/* SUBFLOW 4: Concise Forgot Password Reset (No verbose instructions!) */}
+          {/* SUBFLOW 4: Forgot Password Reset (Separate OTP 6-digit & Separate Link) */}
           {subFlow === 'forgot-verify-reset' && (
-            <div className="space-y-3.5 relative z-10">
-              <form onSubmit={handleForgotPasswordReset} className="space-y-3">
-                <div className="relative flex items-center overflow-hidden rounded-lg">
-                  <KeyRound className="absolute left-3 w-4 h-4 text-emerald-400" />
-                  <input
-                    type="text"
-                    required
-                    disabled={lockoutSeconds > 0 || remainingOtpAttempts <= 0}
-                    aria-label="Dán link hoặc mã khôi phục từ Gmail"
-                    placeholder="Dán link hoặc mã trong Gmail vào đây"
-                    value={otpCode}
-                    onChange={(e) => setOtpCode(e.target.value)}
-                    className="w-full bg-white/10 border border-white/20 focus:border-emerald-400 rounded-lg text-white placeholder:text-white/40 h-10 text-xs pl-10 pr-3 focus:outline-none disabled:opacity-50"
-                  />
-                </div>
-
+            <div className="space-y-3 relative z-10">
+              {/* New Password Inputs */}
+              <div className="space-y-2.5">
                 <div className="relative flex items-center overflow-hidden rounded-lg">
                   <Lock className="absolute left-3 w-4 h-4 text-white/40" />
                   <input
@@ -995,14 +1063,58 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
                     {showConfirmPass ? <Eye className="w-4 h-4" /> : <EyeOff className="w-4 h-4" />}
                   </button>
                 </div>
+              </div>
 
+              {/* Cách 1: Nhập Mã OTP 6 Số Riêng */}
+              <form onSubmit={handleForgotPasswordResetByOtp} className="space-y-2 pt-1">
+                <div className="relative flex items-center overflow-hidden rounded-lg">
+                  <KeyRound className="absolute left-3 w-4 h-4 text-emerald-400" />
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    maxLength={6}
+                    disabled={lockoutSeconds > 0 || remainingOtpAttempts <= 0}
+                    aria-label="Nhập mã OTP 6 số"
+                    placeholder="Nhập mã OTP 6 số từ Gmail"
+                    value={otpCode}
+                    onChange={(e) => setOtpCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                    className="w-full bg-white/10 border border-white/20 focus:border-emerald-400 rounded-lg text-white placeholder:text-white/40 h-10 text-sm font-mono tracking-widest pl-10 pr-3 focus:outline-none disabled:opacity-50"
+                  />
+                </div>
                 <button
                   type="submit"
                   disabled={loading || lockoutSeconds > 0 || remainingOtpAttempts <= 0}
-                  className="w-full bg-emerald-500 hover:bg-emerald-400 text-black font-semibold h-10 rounded-lg transition-all flex items-center justify-center gap-1.5 text-sm cursor-pointer disabled:opacity-50"
+                  className="w-full bg-emerald-500 hover:bg-emerald-400 text-black font-semibold h-9 rounded-lg transition-all flex items-center justify-center gap-1.5 text-xs sm:text-sm cursor-pointer disabled:opacity-50"
                 >
                   {loading && <Loader2 className="w-4 h-4 animate-spin" />}
-                  <span>Đặt Lại Mật Khẩu Mới</span>
+                  <span>Đổi Mật Khẩu Bằng Mã OTP 6 Số</span>
+                </button>
+              </form>
+
+              <div className="flex items-center gap-2">
+                <div className="h-px bg-white/10 flex-1" />
+                <span className="text-[10px] text-white/40 uppercase">Hoặc dùng Link riêng</span>
+                <div className="h-px bg-white/10 flex-1" />
+              </div>
+
+              {/* Cách 2: Dán Link Khôi Phục Riêng */}
+              <form onSubmit={handleForgotPasswordResetByLink} className="space-y-2">
+                <input
+                  type="text"
+                  disabled={lockoutSeconds > 0 || remainingOtpAttempts <= 0}
+                  aria-label="Dán đường link từ Gmail"
+                  placeholder="Dán đường link khôi phục từ Gmail..."
+                  value={gmailLink}
+                  onChange={(e) => setGmailLink(e.target.value)}
+                  className="w-full bg-white/5 border border-white/15 focus:border-indigo-400 rounded-lg text-white placeholder:text-white/35 h-9 text-xs px-3 focus:outline-none disabled:opacity-50"
+                />
+                <button
+                  type="submit"
+                  disabled={loading || lockoutSeconds > 0 || remainingOtpAttempts <= 0}
+                  className="w-full bg-indigo-500 hover:bg-indigo-400 text-white font-semibold h-9 rounded-lg transition-all flex items-center justify-center gap-1.5 text-xs cursor-pointer disabled:opacity-50"
+                >
+                  {loading && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                  <span>Đổi Mật Khẩu Bằng Link Gmail</span>
                 </button>
               </form>
 
@@ -1028,7 +1140,7 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
                   }}
                   className="text-emerald-400 hover:text-emerald-300 font-medium cursor-pointer"
                 >
-                  Đã đổi qua link Gmail →
+                  Đã đổi trực tiếp qua Link →
                 </button>
               </div>
             </div>

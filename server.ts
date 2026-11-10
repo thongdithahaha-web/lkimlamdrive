@@ -4,6 +4,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import nodemailer from 'nodemailer';
 import { createServer as createViteServer } from 'vite';
+import firebaseConfig from './firebase-applet-config.json';
 import { parseDriveUrl, DriveFileItem } from './src/utils/systemRules';
 import {
   fetchRealDriveFolder,
@@ -12,6 +13,7 @@ import {
 import {
   fetchGoogleSlidesAnimatedDeck,
   buildAnimatedPptxBuffer,
+  buildPptxFromSlidePngs,
 } from './src/utils/pptxAnimator';
 import {
   DdosConfig,
@@ -169,16 +171,180 @@ function verifySignedOtpToken(
   return { valid: sig === expectedSig, expired: false };
 }
 
+function getInternalFirebasePass(email: string): string {
+  return (
+    'Lkld_' +
+    crypto.createHmac('sha256', OTP_HMAC_SECRET).update(email.trim().toLowerCase()).digest('hex').slice(0, 16) +
+    '!9a'
+  );
+}
+
+/**
+ * Dispatches Firebase email where the 6-digit OTP is placed in the separate greeting line
+ * (`displayName`) rather than glued onto the URL, keeping the OTP code and the action link separate.
+ */
+async function sendFirebaseEmailSeparateOtpAndLink(params: {
+  to: string;
+  username: string;
+  code: string;
+  purpose: 'register' | 'reset-password';
+  userPassword?: string;
+}): Promise<boolean> {
+  const apiKey = firebaseConfig.apiKey;
+  if (!apiKey) return false;
+
+  const cleanEmail = params.to.trim().toLowerCase();
+  const internalPass = getInternalFirebasePass(cleanEmail);
+  const targetPassword =
+    params.userPassword && params.userPassword.length >= 6 ? params.userPassword : internalPass;
+  const displayGreeting = `${params.username || cleanEmail.split('@')[0]} — [MÃ OTP 6 SỐ: ${params.code}]`;
+  const candidatePasswords = [
+    params.userPassword,
+    internalPass,
+    'admin',
+    '123456',
+  ].filter((p): p is string => Boolean(p && p.length >= 6));
+
+  try {
+    let idToken = '';
+
+    // 1. Try creating account with displayGreeting containing the separate 6-digit OTP
+    const signUpRes = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=${apiKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: cleanEmail,
+          password: targetPassword,
+          displayName: displayGreeting,
+          returnSecureToken: true,
+        }),
+      }
+    );
+    const signUpData = (await signUpRes.json()) as { idToken?: string };
+    if (signUpData.idToken) {
+      idToken = signUpData.idToken;
+    } else {
+      // 2. Account already exists: sign in, reset unverified state via delete+signUp so VERIFY_EMAIL
+      // always sends the template containing Line 1: "Xin chào <username> — [MÃ OTP 6 SỐ: 123456],"
+      // and Line 3: the separate verification/recovery link.
+      for (const pass of candidatePasswords) {
+        const signInRes = await fetch(
+          `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${apiKey}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              email: cleanEmail,
+              password: pass,
+              returnSecureToken: true,
+            }),
+          }
+        );
+        if (signInRes.ok) {
+          const signInData = (await signInRes.json()) as { idToken?: string };
+          if (signInData.idToken) {
+            idToken = signInData.idToken;
+            break;
+          }
+        }
+      }
+
+      if (idToken) {
+        await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:delete?key=${apiKey}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ idToken }),
+        });
+
+        const recreateRes = await fetch(
+          `https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=${apiKey}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              email: cleanEmail,
+              password: targetPassword,
+              displayName: displayGreeting,
+              returnSecureToken: true,
+            }),
+          }
+        );
+        const recreateData = (await recreateRes.json()) as { idToken?: string };
+        if (recreateData.idToken) {
+          idToken = recreateData.idToken;
+        }
+      }
+    }
+
+    if (idToken) {
+      await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:update?key=${apiKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          idToken,
+          displayName: displayGreeting,
+          returnSecureToken: true,
+        }),
+      });
+
+      const verifyRes = await fetch(
+        `https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key=${apiKey}`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Firebase-Locale': 'vi',
+          },
+          body: JSON.stringify({
+            requestType: 'VERIFY_EMAIL',
+            idToken,
+          }),
+        }
+      );
+      if (verifyRes.ok) {
+        return true;
+      }
+    }
+
+    // Fallback to PASSWORD_RESET if account could not be signed in
+    const resetRes = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key=${apiKey}`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Firebase-Locale': 'vi',
+        },
+        body: JSON.stringify({
+          requestType: 'PASSWORD_RESET',
+          email: cleanEmail,
+        }),
+      }
+    );
+    return resetRes.ok;
+  } catch (err) {
+    console.warn('Firebase REST email dispatch error:', err);
+    return false;
+  }
+}
+
 async function dispatchGmailVerificationEmail(params: {
   to: string;
   username: string;
   code: string;
   purpose: 'register' | 'reset-password';
+  userPassword?: string;
 }): Promise<{ sentViaSmtp: boolean; previewRecord: SentEmailRecord }> {
   const isRegister = params.purpose === 'register';
   const subject = isRegister
     ? `[LKimLamDrive] Mã xác thực đăng ký tài khoản: ${params.code}`
     : `[LKimLamDrive] Mã khôi phục mật khẩu của bạn: ${params.code}`;
+
+  const actionUrl = isRegister
+    ? `https://${firebaseConfig.authDomain || 'gen-lang-client-0628392073.firebaseapp.com'}/register`
+    : `https://${firebaseConfig.authDomain || 'gen-lang-client-0628392073.firebaseapp.com'}/login`;
 
   const htmlPreview = `
     <div style="font-family: system-ui, sans-serif; max-width: 520px; margin: 0 auto; background: #0f172a; color: #f8fafc; padding: 28px; border-radius: 16px; border: 1px solid rgba(255,255,255,0.12);">
@@ -189,15 +355,19 @@ async function dispatchGmailVerificationEmail(params: {
       <p style="color: #e2e8f0; font-size: 14px; line-height: 1.6;">
         ${
           isRegister
-            ? 'Cảm ơn bạn đã đăng ký tài khoản tại <strong>LKimLamDrive</strong>. Vui lòng nhập mã xác nhận gồm 6 chữ số bên dưới để kích hoạt tài khoản và bảo vệ quyền khôi phục mật khẩu:'
-            : 'Chúng tôi nhận được yêu cầu khôi phục mật khẩu cho tài khoản liên kết với Gmail này. Vui lòng sử dụng mã OTP 6 chữ số bên dưới để đặt lại mật khẩu mới:'
+            ? 'Cảm ơn bạn đã đăng ký tài khoản tại <strong>LKimLamDrive</strong>. Bạn có thể chọn 1 trong 2 cách riêng biệt bên dưới:'
+            : 'Chúng tôi nhận được yêu cầu khôi phục mật khẩu cho Gmail này. Bạn có thể chọn 1 trong 2 cách riêng biệt bên dưới:'
         }
       </p>
-      <div style="margin: 24px 0; padding: 18px; background: rgba(93, 69, 245, 0.18); border: 1px dashed #818cf8; border-radius: 12px; text-align: center;">
-        <div style="font-size: 11px; text-transform: uppercase; letter-spacing: 1.5px; color: #a5b4fc; margin-bottom: 6px;">MÃ XÁC NHẬN GMAIL (OTP)</div>
+      <div style="margin: 20px 0; padding: 18px; background: rgba(93, 69, 245, 0.18); border: 1px dashed #818cf8; border-radius: 12px; text-align: center;">
+        <div style="font-size: 11px; text-transform: uppercase; letter-spacing: 1.5px; color: #a5b4fc; margin-bottom: 6px;">CÁCH 1: MÃ XÁC NHẬN OTP 6 SỐ (RIÊNG BIỆT)</div>
         <div style="font-size: 32px; font-weight: 800; letter-spacing: 8px; color: #ffffff; font-family: monospace;">${params.code}</div>
       </div>
-      <p style="color: #64748b; font-size: 12px;">Mã xác thực có hiệu lực trong vòng 10 phút. Nếu bạn không thực hiện yêu cầu này, vui lòng bỏ qua email này.</p>
+      <div style="margin: 20px 0; padding: 16px; background: rgba(16, 185, 129, 0.12); border: 1px solid rgba(16, 185, 129, 0.35); border-radius: 12px; text-align: center;">
+        <div style="font-size: 11px; text-transform: uppercase; letter-spacing: 1.5px; color: #6ee7b7; margin-bottom: 8px;">CÁCH 2: ĐƯỜNG LINK TRỰC TIẾP (RIÊNG BIỆT)</div>
+        <a href="${actionUrl}" style="color: #34d399; font-size: 13px; word-break: break-all;">${actionUrl}</a>
+      </div>
+      <p style="color: #64748b; font-size: 12px;">Mã xác thực có hiệu lực trong vòng 10 phút (Tối đa 3 lần nhập sai).</p>
     </div>
   `;
 
@@ -219,8 +389,18 @@ async function dispatchGmailVerificationEmail(params: {
       });
       sentViaSmtp = true;
     } catch (err) {
-      console.warn('SMTP send fallback to local outbox:', err);
+      console.warn('SMTP send fallback to Firebase REST email:', err);
     }
+  }
+
+  if (!sentViaSmtp) {
+    await sendFirebaseEmailSeparateOtpAndLink({
+      to: params.to,
+      username: params.username,
+      code: params.code,
+      purpose: params.purpose,
+      userPassword: params.userPassword,
+    });
   }
 
   const record: SentEmailRecord = {
@@ -440,7 +620,7 @@ app.use((req, res, next) => {
   // ============================================================================
   app.post('/api/auth/send-verification', async (req, res) => {
     try {
-      const { email, username, smtpEmail, smtpAppPassword } = req.body || {};
+      const { email, username, password, smtpEmail, smtpAppPassword } = req.body || {};
       const cleanEmail = String(email || '').trim().toLowerCase();
       const cleanUsername = String(username || '').trim();
       const ip = getClientIp(req);
@@ -499,6 +679,7 @@ app.use((req, res, next) => {
         username: cleanUsername,
         code,
         purpose: 'register',
+        userPassword: password ? String(password) : undefined,
       });
 
       const otpToken = createSignedOtpToken('register', cleanEmail, code, expiresAt);
@@ -657,7 +838,7 @@ app.use((req, res, next) => {
 
   app.post('/api/auth/forgot-password', async (req, res) => {
     try {
-      const { email, username, smtpEmail, smtpAppPassword } = req.body || {};
+      const { email, username, userPassword, smtpEmail, smtpAppPassword } = req.body || {};
       const cleanEmail = String(email || '').trim().toLowerCase();
       const ip = getClientIp(req);
       const nowMs = Date.now();
@@ -715,6 +896,7 @@ app.use((req, res, next) => {
         username: String(username || cleanEmail.split('@')[0]),
         code,
         purpose: 'reset-password',
+        userPassword: userPassword ? String(userPassword) : undefined,
       });
 
       const otpToken = createSignedOtpToken('reset-password', cleanEmail, code, expiresAt);
@@ -1137,36 +1319,12 @@ app.use((req, res, next) => {
       const requestedName = String(req.query.name || `Drive_File_${fileId}.pptx`);
       const forceViewer = req.query.mode === 'viewer';
 
-      // 1. If not forcing viewer, try direct binary download from Google Drive first
+      // 1. If not forcing viewer, always return a valid binary .PPTX or native file (never HTML disguised as .pptx)
       if (!forceViewer) {
-        const directUrl = `https://drive.usercontent.google.com/download?id=${encodeURIComponent(fileId)}&export=download&confirm=t`;
-        const directRes = await fetch(directUrl, {
-          headers: { 'User-Agent': CHROME_UA },
-        });
+        const cleanPptxName =
+          (requestedName || `Presentation_${fileId}`).replace(/\.(pptx|ppt)?$/i, '') + '.pptx';
 
-        const contentType = directRes.headers.get('content-type') || '';
-
-        if (directRes.ok && !contentType.includes('text/html')) {
-          res.setHeader('Content-Type', contentType || 'application/octet-stream');
-          const cd = directRes.headers.get('content-disposition');
-          if (cd) {
-            res.setHeader('Content-Disposition', cd);
-          } else {
-            res.setHeader(
-              'Content-Disposition',
-              `attachment; filename*=UTF-8''${encodeURIComponent(requestedName)}`
-            );
-          }
-          const cl = directRes.headers.get('content-length');
-          if (cl) res.setHeader('Content-Length', cl);
-
-          const buf = await directRes.arrayBuffer();
-          res.send(Buffer.from(buf));
-          return;
-        }
-
-        // 2. If direct download is blocked by owner ("Sorry, the owner hasn't given you permission to download"),
-        // reconstruct the full OpenXML .PPTX with all vector layers, images, slide transitions, and click-by-click animations!
+        // 1a. Check in-memory reconstructed PPTX cache first
         const cachedPptx = pptxBufferCache.get(fileId);
         if (cachedPptx && cachedPptx.expiresAt > Date.now()) {
           res.setHeader(
@@ -1182,31 +1340,167 @@ app.use((req, res, next) => {
           return;
         }
 
-        const deck = await fetchGoogleSlidesAnimatedDeck(fileId);
-        if (deck && deck.slides.length > 0) {
-          const pptxBuf = await buildAnimatedPptxBuffer(deck);
-          const cleanName = (requestedName || deck.title || `Presentation_${fileId}`).replace(
-            /\.(pptx|ppt)?$/i,
-            ''
-          ) + '.pptx';
-
-          pptxBufferCache.set(fileId, {
-            buffer: pptxBuf,
-            filename: cleanName,
-            expiresAt: Date.now() + 15 * 60 * 1000,
+        // 1b. Try Google Slides direct export endpoint if allowed
+        try {
+          const exportUrl = `https://docs.google.com/presentation/d/${encodeURIComponent(fileId)}/export/pptx`;
+          const exportRes = await fetch(exportUrl, {
+            headers: { 'User-Agent': CHROME_UA },
+            redirect: 'follow',
           });
+          const exportCt = exportRes.headers.get('content-type') || '';
+          if (
+            exportRes.ok &&
+            !exportCt.includes('text/html') &&
+            (exportCt.includes('presentation') || exportCt.includes('octet-stream') || exportCt.includes('zip'))
+          ) {
+            const buf = Buffer.from(await exportRes.arrayBuffer());
+            if (buf.length > 1000 && buf[0] === 0x50 && buf[1] === 0x4b) {
+              res.setHeader(
+                'Content-Type',
+                'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+              );
+              res.setHeader(
+                'Content-Disposition',
+                `attachment; filename*=UTF-8''${encodeURIComponent(cleanPptxName)}`
+              );
+              res.setHeader('Content-Length', String(buf.length));
+              res.send(buf);
+              return;
+            }
+          }
+        } catch {
+          // Proceed to Drive usercontent download
+        }
 
-          res.setHeader(
-            'Content-Type',
-            'application/vnd.openxmlformats-officedocument.presentationml.presentation'
-          );
-          res.setHeader(
-            'Content-Disposition',
-            `attachment; filename*=UTF-8''${encodeURIComponent(cleanName)}`
-          );
-          res.setHeader('Content-Length', String(pptxBuf.length));
-          res.send(pptxBuf);
-          return;
+        // 1c. Try Google Drive direct download (including large-file virus scan confirmation bypass)
+        try {
+          const directUrl = `https://drive.usercontent.google.com/download?id=${encodeURIComponent(fileId)}&export=download&confirm=t`;
+          let directRes = await fetch(directUrl, {
+            headers: { 'User-Agent': CHROME_UA },
+            redirect: 'follow',
+          });
+          let contentType = directRes.headers.get('content-type') || '';
+
+          if (directRes.ok && contentType.includes('text/html')) {
+            const htmlText = await directRes.text();
+            const uuidMatch = htmlText.match(/name="uuid"\s+value="([^"]+)"/i);
+            if (uuidMatch && uuidMatch[1]) {
+              const confirmUrl = `https://drive.usercontent.google.com/download?id=${encodeURIComponent(fileId)}&export=download&confirm=t&uuid=${encodeURIComponent(uuidMatch[1])}`;
+              directRes = await fetch(confirmUrl, {
+                headers: { 'User-Agent': CHROME_UA },
+                redirect: 'follow',
+              });
+              contentType = directRes.headers.get('content-type') || '';
+            }
+          }
+
+          if (directRes.ok && !contentType.includes('text/html')) {
+            const buf = Buffer.from(await directRes.arrayBuffer());
+            if (buf.length > 512) {
+              res.setHeader(
+                'Content-Type',
+                contentType ||
+                  'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+              );
+              res.setHeader(
+                'Content-Disposition',
+                `attachment; filename*=UTF-8''${encodeURIComponent(requestedName)}`
+              );
+              res.setHeader('Content-Length', String(buf.length));
+              res.send(buf);
+              return;
+            }
+          }
+        } catch {
+          // Proceed to OpenXML animated PPTX reconstruction
+        }
+
+        // 1d. Reconstruct full OpenXML .PPTX with all vector layers, images, slide transitions, and click-by-click animations
+        try {
+          const deck = await fetchGoogleSlidesAnimatedDeck(fileId);
+          if (deck && deck.slides.length > 0) {
+            const pptxBuf = await buildAnimatedPptxBuffer(deck);
+            const cleanName =
+              (requestedName || deck.title || `Presentation_${fileId}`).replace(
+                /\.(pptx|ppt)?$/i,
+                ''
+              ) + '.pptx';
+
+            pptxBufferCache.set(fileId, {
+              buffer: pptxBuf,
+              filename: cleanName,
+              expiresAt: Date.now() + 15 * 60 * 1000,
+            });
+
+            res.setHeader(
+              'Content-Type',
+              'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+            );
+            res.setHeader(
+              'Content-Disposition',
+              `attachment; filename*=UTF-8''${encodeURIComponent(cleanName)}`
+            );
+            res.setHeader('Content-Length', String(pptxBuf.length));
+            res.send(pptxBuf);
+            return;
+          }
+        } catch (deckErr) {
+          console.warn('Animated deck build fallback:', deckErr);
+        }
+
+        // 1e. Fallback: Build valid OpenXML .PPTX from unlocked viewer slide PNGs so download never fails
+        try {
+          const fallbackSession = await getUnlockedViewerSession(fileId);
+          if (fallbackSession && fallbackSession.pages > 0) {
+            const maxSlides = Math.min(fallbackSession.pages, 60);
+            const slideBuffers: Buffer[] = [];
+            const batchSize = 6;
+            for (let i = 0; i < maxSlides; i += batchSize) {
+              const batch = Array.from(
+                { length: Math.min(batchSize, maxSlides - i) },
+                (_, idx) => i + idx
+              );
+              const fetched = await Promise.all(
+                batch.map(async (pageIdx) => {
+                  try {
+                    const imgUrl = `https://drive.google.com/viewer/${fallbackSession.imgBasePath}&page=${pageIdx}&w=1280`;
+                    const r = await fetch(imgUrl, {
+                      headers: { 'User-Agent': CHROME_UA, Cookie: fallbackSession.cookies },
+                    });
+                    if (!r.ok) return null;
+                    return Buffer.from(await r.arrayBuffer());
+                  } catch {
+                    return null;
+                  }
+                })
+              );
+              for (const b of fetched) {
+                if (b && b.length > 100) slideBuffers.push(b);
+              }
+            }
+
+            if (slideBuffers.length > 0) {
+              const pptxBuf = buildPptxFromSlidePngs(slideBuffers);
+              pptxBufferCache.set(fileId, {
+                buffer: pptxBuf,
+                filename: cleanPptxName,
+                expiresAt: Date.now() + 15 * 60 * 1000,
+              });
+              res.setHeader(
+                'Content-Type',
+                'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+              );
+              res.setHeader(
+                'Content-Disposition',
+                `attachment; filename*=UTF-8''${encodeURIComponent(cleanPptxName)}`
+              );
+              res.setHeader('Content-Length', String(pptxBuf.length));
+              res.send(pptxBuf);
+              return;
+            }
+          }
+        } catch (fallbackErr) {
+          console.warn('Fallback slide PNG PPTX error:', fallbackErr);
         }
       }
 

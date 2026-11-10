@@ -179,18 +179,27 @@ export async function fetchGoogleSlidesAnimatedDeck(
 
   const urlToDataUri = new Map<string, string>();
   await Promise.all(
-    Array.from(imageUrls).map(async (url) => {
-      try {
-        const imgRes = await fetch(url, { headers: { 'User-Agent': CHROME_UA } });
-        if (imgRes.ok) {
-          const cType = imgRes.headers.get('content-type') || 'image/png';
-          const buf = Buffer.from(await imgRes.arrayBuffer());
-          urlToDataUri.set(url, `data:${cType};base64,${buf.toString('base64')}`);
+    Array.from(imageUrls)
+      .slice(0, 60)
+      .map(async (url) => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 3500);
+        try {
+          const imgRes = await fetch(url, {
+            headers: { 'User-Agent': CHROME_UA },
+            signal: controller.signal,
+          });
+          if (imgRes.ok) {
+            const cType = imgRes.headers.get('content-type') || 'image/png';
+            const buf = Buffer.from(await imgRes.arrayBuffer());
+            urlToDataUri.set(url, `data:${cType};base64,${buf.toString('base64')}`);
+          }
+        } catch {
+          // ignore single image failure or timeout
+        } finally {
+          clearTimeout(timer);
         }
-      } catch {
-        // ignore single image failure
-      }
-    })
+      })
   );
 
   const slideSvgMap = new Map<string, string>();
@@ -279,13 +288,17 @@ export async function fetchGoogleSlidesAnimatedDeck(
       const { extractedGroup, remainingSvg } = extractSvgGroupById(baseSvg, targetId);
       if (extractedGroup) {
         baseSvg = remainingSvg;
-        const layerSvg = `<svg version="1.1" viewBox="${viewBox}" fill="none" stroke="none" stroke-linecap="square" stroke-miterlimit="10" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns="http://www.w3.org/2000/svg">${sharedDefs}${extractedGroup}</svg>`;
+        const layerSvg = `<svg version="1.1" width="1280" height="720" viewBox="${viewBox}" fill="none" stroke="none" stroke-linecap="square" stroke-miterlimit="10" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns="http://www.w3.org/2000/svg">${sharedDefs}${extractedGroup}</svg>`;
         animatedElements.push({
           targetId,
           svg: layerSvg,
           startsHidden: targetFirstState.get(targetId) ?? true,
         });
       }
+    }
+
+    if (!baseSvg.includes('width="')) {
+      baseSvg = baseSvg.replace('<svg ', '<svg width="1280" height="720" ');
     }
 
     slides.push({
@@ -301,12 +314,31 @@ export async function fetchGoogleSlidesAnimatedDeck(
   return { title, slides };
 }
 
-function renderSvgToPngBuffer(svg: string, width = 1280): Buffer {
-  const resvg = new Resvg(svg, {
-    font: { loadSystemFonts: false },
-    fitTo: { mode: 'width', value: width },
-  });
-  return resvg.render().asPng();
+// Valid 1x1 transparent PNG fallback in case native @resvg/resvg-js fails on a serverless runtime
+const FALLBACK_1X1_PNG = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+  'base64'
+);
+
+function renderSvgToPngBuffer(svg: string, width = 960): Buffer {
+  try {
+    const resvg = new Resvg(svg, {
+      font: { loadSystemFonts: false },
+      fitTo: { mode: 'width', value: width },
+    });
+    return resvg.render().asPng();
+  } catch {
+    return FALLBACK_1X1_PNG;
+  }
+}
+
+function escapeXmlAttr(str: string): string {
+  return String(str || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
 }
 
 /**
@@ -355,9 +387,7 @@ export async function buildAnimatedPptxBuffer(deck: ParsedPresentationDeck): Pro
 
   // 3. ppt/presentation.xml & ppt/_rels/presentation.xml.rels
   const sldIdLst = deck.slides
-    .map(
-      (_, i) => `<p:sldId id="${256 + i}" r:id="rIdSlide${i + 1}"/>`
-    )
+    .map((_, i) => `<p:sldId id="${256 + i}" r:id="rIdSlide${i + 1}"/>`)
     .join('\n    ');
 
   addXml(
@@ -372,6 +402,11 @@ export async function buildAnimatedPptxBuffer(deck: ParsedPresentationDeck): Pro
   </p:sldIdLst>
   <p:sldSz cx="12192000" cy="6858000"/>
   <p:notesSz cx="6858000" cy="9144000"/>
+  <p:defaultTextStyle>
+    <a:defPPr>
+      <a:defRPr lang="vi-VN"/>
+    </a:defPPr>
+  </p:defaultTextStyle>
 </p:presentation>`
   );
 
@@ -424,6 +459,11 @@ export async function buildAnimatedPptxBuffer(deck: ParsedPresentationDeck): Pro
   <p:sldLayoutIdLst>
     <p:sldLayoutId id="2147483649" r:id="rIdLayout1"/>
   </p:sldLayoutIdLst>
+  <p:txStyles>
+    <p:titleStyle/>
+    <p:bodyStyle/>
+    <p:otherStyle/>
+  </p:txStyles>
 </p:sldMaster>`
   );
 
@@ -504,6 +544,7 @@ export async function buildAnimatedPptxBuffer(deck: ParsedPresentationDeck): Pro
 
   // 5. Generate each slide and its media assets
   let mediaCounter = 1;
+  let rasterCount = 0;
 
   for (let sIdx = 0; sIdx < slideCount; sIdx++) {
     const slide = deck.slides[sIdx];
@@ -518,7 +559,8 @@ export async function buildAnimatedPptxBuffer(deck: ParsedPresentationDeck): Pro
     const baseMediaId = mediaCounter++;
     const basePngName = `image${baseMediaId}.png`;
     const baseSvgName = `svg${baseMediaId}.svg`;
-    const basePngBuf = renderSvgToPngBuffer(slide.baseSvg, 1280);
+    const basePngBuf =
+      rasterCount < 45 ? (rasterCount++, renderSvgToPngBuffer(slide.baseSvg, 960)) : FALLBACK_1X1_PNG;
     zipEntries.push({ name: `ppt/media/${basePngName}`, data: basePngBuf });
     zipEntries.push({
       name: `ppt/media/${baseSvgName}`,
@@ -547,7 +589,8 @@ export async function buildAnimatedPptxBuffer(deck: ParsedPresentationDeck): Pro
       const elMediaId = mediaCounter++;
       const elPngName = `image${elMediaId}.png`;
       const elSvgName = `svg${elMediaId}.svg`;
-      const elPngBuf = renderSvgToPngBuffer(animEl.svg, 960);
+      const elPngBuf =
+        rasterCount < 45 ? (rasterCount++, renderSvgToPngBuffer(animEl.svg, 640)) : FALLBACK_1X1_PNG;
       zipEntries.push({ name: `ppt/media/${elPngName}`, data: elPngBuf });
       zipEntries.push({
         name: `ppt/media/${elSvgName}`,
@@ -612,15 +655,201 @@ export async function buildAnimatedPptxBuffer(deck: ParsedPresentationDeck): Pro
   return createZipArchive(zipEntries);
 }
 
+/**
+ * Fallback OpenXML .pptx builder from slide PNG buffers (used when a Drive file only exposes viewer page images).
+ */
+export function buildPptxFromSlidePngs(slideBuffers: Buffer[]): Buffer {
+  const validBuffers = slideBuffers.length > 0 ? slideBuffers : [FALLBACK_1X1_PNG];
+  const zipEntries: Array<{ name: string; data: Buffer }> = [];
+  const addXml = (name: string, xml: string) => {
+    zipEntries.push({ name, data: Buffer.from(xml.trim(), 'utf-8') });
+  };
+
+  const slideOverrides = validBuffers
+    .map(
+      (_, i) =>
+        `<Override PartName="/ppt/slides/slide${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>`
+    )
+    .join('\n  ');
+
+  addXml(
+    '[Content_Types].xml',
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Default Extension="png" ContentType="image/png"/>
+  <Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>
+  <Override PartName="/ppt/slideMasters/slideMaster1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml"/>
+  <Override PartName="/ppt/slideLayouts/slideLayout1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml"/>
+  <Override PartName="/ppt/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/>
+  ${slideOverrides}
+</Types>`
+  );
+
+  addXml(
+    '_rels/.rels',
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/>
+</Relationships>`
+  );
+
+  const sldIdLst = validBuffers
+    .map((_, i) => `<p:sldId id="${256 + i}" r:id="rIdSlide${i + 1}"/>`)
+    .join('\n    ');
+
+  addXml(
+    'ppt/presentation.xml',
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:presentation xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" saveSubsetFonts="1">
+  <p:sldMasterIdLst>
+    <p:sldMasterId id="2147483648" r:id="rIdMaster1"/>
+  </p:sldMasterIdLst>
+  <p:sldIdLst>
+    ${sldIdLst}
+  </p:sldIdLst>
+  <p:sldSz cx="12192000" cy="6858000"/>
+  <p:notesSz cx="6858000" cy="9144000"/>
+  <p:defaultTextStyle><a:defPPr><a:defRPr lang="vi-VN"/></a:defPPr></p:defaultTextStyle>
+</p:presentation>`
+  );
+
+  const presRels = validBuffers
+    .map(
+      (_, i) =>
+        `<Relationship Id="rIdSlide${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide${i + 1}.xml"/>`
+    )
+    .join('\n  ');
+
+  addXml(
+    'ppt/_rels/presentation.xml.rels',
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rIdMaster1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster" Target="slideMasters/slideMaster1.xml"/>
+  <Relationship Id="rIdTheme1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="theme/theme1.xml"/>
+  ${presRels}
+</Relationships>`
+  );
+
+  addXml(
+    'ppt/slideMasters/slideMaster1.xml',
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sldMaster xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+  <p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr></p:spTree></p:cSld>
+  <p:clrMap bg1="lt1" tx1="dk1" bg2="lt2" tx2="dk2" accent1="accent1" accent2="accent2" accent3="accent3" accent4="accent4" accent5="accent5" accent6="accent6" hlink="hlink" folHlink="folHlink"/>
+  <p:sldLayoutIdLst><p:sldLayoutId id="2147483649" r:id="rIdLayout1"/></p:sldLayoutIdLst>
+  <p:txStyles><p:titleStyle/><p:bodyStyle/><p:otherStyle/></p:txStyles>
+</p:sldMaster>`
+  );
+
+  addXml(
+    'ppt/slideMasters/_rels/slideMaster1.xml.rels',
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rIdLayout1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>
+  <Relationship Id="rIdTheme1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="../theme/theme1.xml"/>
+</Relationships>`
+  );
+
+  addXml(
+    'ppt/slideLayouts/slideLayout1.xml',
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sldLayout xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" type="blank" preserve="1">
+  <p:cSld name="Blank"><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr></p:spTree></p:cSld>
+  <p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr>
+</p:sldLayout>`
+  );
+
+  addXml(
+    'ppt/slideLayouts/_rels/slideLayout1.xml.rels',
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rIdMaster1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster" Target="../slideMasters/slideMaster1.xml"/>
+</Relationships>`
+  );
+
+  addXml(
+    'ppt/theme/theme1.xml',
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="Office Theme">
+  <a:themeElements>
+    <a:clrScheme name="Office">
+      <a:dk1><a:sysClr val="windowText" lastClr="000000"/></a:dk1>
+      <a:lt1><a:sysClr val="window" lastClr="FFFFFF"/></a:lt1>
+      <a:dk2><a:srgbClr val="1F497D"/></a:dk2>
+      <a:lt2><a:srgbClr val="EEECE1"/></a:lt2>
+      <a:accent1><a:srgbClr val="4F81BD"/></a:accent1>
+      <a:accent2><a:srgbClr val="C0504D"/></a:accent2>
+      <a:accent3><a:srgbClr val="9BBB59"/></a:accent3>
+      <a:accent4><a:srgbClr val="8064A2"/></a:accent4>
+      <a:accent5><a:srgbClr val="4BACC6"/></a:accent5>
+      <a:accent6><a:srgbClr val="F79646"/></a:accent6>
+      <a:hlink><a:srgbClr val="0000FF"/></a:hlink>
+      <a:folHlink><a:srgbClr val="800080"/></a:folHlink>
+    </a:clrScheme>
+    <a:fontScheme name="Office">
+      <a:majorFont><a:latin typeface="Arial"/><a:ea typeface=""/><a:cs typeface=""/></a:majorFont>
+      <a:minorFont><a:latin typeface="Arial"/><a:ea typeface=""/><a:cs typeface=""/></a:minorFont>
+    </a:fontScheme>
+    <a:fmtScheme name="Office">
+      <a:fillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:fillStyleLst>
+      <a:lnStyleLst><a:ln w="9525"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln><a:ln w="9525"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln><a:ln w="9525"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln></a:lnStyleLst>
+      <a:effectStyleLst><a:effectStyle><a:effectLst/></a:effectStyle><a:effectStyle><a:effectLst/></a:effectStyle><a:effectStyle><a:effectLst/></a:effectStyle></a:effectStyleLst>
+      <a:bgFillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:bgFillStyleLst>
+    </a:fmtScheme>
+  </a:themeElements>
+</a:theme>`
+  );
+
+  for (let i = 0; i < validBuffers.length; i++) {
+    const slideNum = i + 1;
+    const pngName = `image${slideNum}.png`;
+    zipEntries.push({ name: `ppt/media/${pngName}`, data: validBuffers[i] });
+
+    addXml(
+      `ppt/slides/slide${slideNum}.xml`,
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+  <p:cSld>
+    <p:spTree>
+      <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+      <p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>
+      <p:pic>
+        <p:nvPicPr><p:cNvPr id="2" name="Slide_${slideNum}"/><p:cNvPicPr><a:picLocks noChangeAspect="1"/></p:cNvPicPr><p:nvPr/></p:nvPicPr>
+        <p:blipFill><a:blip r:embed="rIdImg${slideNum}"/><a:stretch><a:fillRect/></a:stretch></p:blipFill>
+        <p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="12192000" cy="6858000"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr>
+      </p:pic>
+    </p:spTree>
+  </p:cSld>
+  <p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr>
+  <p:transition spd="med"><p:push dir="l"/></p:transition>
+</p:sld>`
+    );
+
+    addXml(
+      `ppt/slides/_rels/slide${slideNum}.xml.rels`,
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rIdLayout1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>
+  <Relationship Id="rIdImg${slideNum}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/${pngName}"/>
+</Relationships>`
+    );
+  }
+
+  return createZipArchive(zipEntries);
+}
+
 function buildPicShapeXml(
   spid: number,
   name: string,
   rIdPng: string,
   rIdSvg: string
 ): string {
+  const safeName = escapeXmlAttr(name);
   return `<p:pic>
         <p:nvPicPr>
-          <p:cNvPr id="${spid}" name="${name}"/>
+          <p:cNvPr id="${spid}" name="${safeName}"/>
           <p:cNvPicPr>
             <a:picLocks noChangeAspect="1"/>
           </p:cNvPicPr>
@@ -676,7 +905,7 @@ function buildSlideTimingXml(
 
       if (act.isEntrance) {
         actionPars.push(`<p:par>
-                              <p:cTn id="${effectNodeId}" presetID="10" presetClass="entr" presetSubtype="0" fill="hold" nodeType="${act.triggerType}">
+                              <p:cTn id="${effectNodeId}" presetID="10" presetClass="entr" presetSubtype="0" fill="hold" grpId="0" nodeType="${act.triggerType}">
                                 <p:stCondLst>
                                   <p:cond delay="${delay}"/>
                                 </p:stCondLst>
@@ -712,7 +941,7 @@ function buildSlideTimingXml(
                             </p:par>`);
       } else {
         actionPars.push(`<p:par>
-                              <p:cTn id="${effectNodeId}" presetID="10" presetClass="exit" presetSubtype="0" fill="hold" nodeType="${act.triggerType}">
+                              <p:cTn id="${effectNodeId}" presetID="10" presetClass="exit" presetSubtype="0" fill="hold" grpId="0" nodeType="${act.triggerType}">
                                 <p:stCondLst>
                                   <p:cond delay="${delay}"/>
                                 </p:stCondLst>

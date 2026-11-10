@@ -273,15 +273,20 @@ export async function confirmFirebaseResetWithCodeOrLink(
 ): Promise<{ ok: boolean; email?: string; error?: string }> {
   const oobCode = extractFirebaseOobCode(rawCodeOrUrl);
   if (!oobCode || oobCode.length < 10) {
-    return { ok: false, error: 'Mã xác thực không hợp lệ' };
+    return { ok: false, error: 'Đường dẫn hoặc mã xác thực không hợp lệ' };
   }
   try {
     const verifiedEmail = await verifyPasswordResetCode(auth, oobCode);
     await confirmPasswordReset(auth, oobCode, newPassword);
     return { ok: true, email: verifiedEmail };
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return { ok: false, error: msg };
+  } catch {
+    try {
+      await applyActionCode(auth, oobCode);
+      return { ok: true };
+    } catch (err2: unknown) {
+      const msg = err2 instanceof Error ? err2.message : String(err2);
+      return { ok: false, error: msg };
+    }
   }
 }
 
