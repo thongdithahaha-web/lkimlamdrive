@@ -1318,13 +1318,22 @@ app.use((req, res, next) => {
     }
   });
 
+  app.get('/api/health', (_req, res) => {
+    res.json({
+      status: 'ok',
+      service: 'LKimLamDrive API',
+      timestamp: new Date().toISOString(),
+      uptime: process.uptime(),
+    });
+  });
+
   app.get('/api/download/file/:fileId', async (req, res) => {
     try {
       const { fileId } = req.params;
       const requestedName = String(req.query.name || `Drive_File_${fileId}.pptx`);
       const forceViewer = req.query.mode === 'viewer';
 
-      // 1. If not forcing viewer, always return a valid binary .PPTX or native file (never HTML disguised as .pptx)
+      // 1. If not forcing viewer, always return a valid binary .PPTX or native file
       if (!forceViewer) {
         const cleanPptxName =
           (requestedName || `Presentation_${fileId}`).replace(/\.(pptx|ppt)?$/i, '') + '.pptx';
@@ -1350,26 +1359,21 @@ app.use((req, res, next) => {
           const exportUrl = `https://docs.google.com/presentation/d/${encodeURIComponent(fileId)}/export/pptx`;
           const exportRes = await fetch(exportUrl, {
             headers: { 'User-Agent': CHROME_UA },
-            redirect: 'follow',
+            redirect: 'manual',
           });
-          const exportCt = exportRes.headers.get('content-type') || '';
-          if (
-            exportRes.ok &&
-            !exportCt.includes('text/html') &&
-            (exportCt.includes('presentation') || exportCt.includes('octet-stream') || exportCt.includes('zip'))
-          ) {
-            const buf = Buffer.from(await exportRes.arrayBuffer());
-            if (buf.length > 1000 && buf[0] === 0x50 && buf[1] === 0x4b) {
-              res.setHeader(
-                'Content-Type',
-                'application/vnd.openxmlformats-officedocument.presentationml.presentation'
-              );
-              res.setHeader(
-                'Content-Disposition',
-                `attachment; filename*=UTF-8''${encodeURIComponent(cleanPptxName)}`
-              );
-              res.setHeader('Content-Length', String(buf.length));
-              res.send(buf);
+          if (exportRes.status >= 300 && exportRes.status < 400) {
+            const loc = exportRes.headers.get('location');
+            if (loc) {
+              res.redirect(302, loc);
+              return;
+            }
+          } else if (exportRes.ok) {
+            const exportCt = exportRes.headers.get('content-type') || '';
+            if (
+              !exportCt.includes('text/html') &&
+              (exportCt.includes('presentation') || exportCt.includes('octet-stream') || exportCt.includes('zip'))
+            ) {
+              res.redirect(302, exportUrl);
               return;
             }
           }
@@ -1380,41 +1384,24 @@ app.use((req, res, next) => {
         // 1c. Try Google Drive direct download (including large-file virus scan confirmation bypass)
         try {
           const directUrl = `https://drive.usercontent.google.com/download?id=${encodeURIComponent(fileId)}&export=download&confirm=t`;
-          let directRes = await fetch(directUrl, {
+          const directRes = await fetch(directUrl, {
             headers: { 'User-Agent': CHROME_UA },
             redirect: 'follow',
           });
-          let contentType = directRes.headers.get('content-type') || '';
+          const contentType = directRes.headers.get('content-type') || '';
 
           if (directRes.ok && contentType.includes('text/html')) {
             const htmlText = await directRes.text();
             const uuidMatch = htmlText.match(/name="uuid"\s+value="([^"]+)"/i);
             if (uuidMatch && uuidMatch[1]) {
               const confirmUrl = `https://drive.usercontent.google.com/download?id=${encodeURIComponent(fileId)}&export=download&confirm=t&uuid=${encodeURIComponent(uuidMatch[1])}`;
-              directRes = await fetch(confirmUrl, {
-                headers: { 'User-Agent': CHROME_UA },
-                redirect: 'follow',
-              });
-              contentType = directRes.headers.get('content-type') || '';
-            }
-          }
-
-          if (directRes.ok && !contentType.includes('text/html')) {
-            const buf = Buffer.from(await directRes.arrayBuffer());
-            if (buf.length > 512) {
-              res.setHeader(
-                'Content-Type',
-                contentType ||
-                  'application/vnd.openxmlformats-officedocument.presentationml.presentation'
-              );
-              res.setHeader(
-                'Content-Disposition',
-                `attachment; filename*=UTF-8''${encodeURIComponent(requestedName)}`
-              );
-              res.setHeader('Content-Length', String(buf.length));
-              res.send(buf);
+              // Redirect directly so browser downloads full file from Google CDN without server payload limits
+              res.redirect(302, confirmUrl);
               return;
             }
+          } else if (directRes.ok && !contentType.includes('text/html')) {
+            res.redirect(302, directUrl);
+            return;
           }
         } catch {
           // Proceed to OpenXML animated PPTX reconstruction
@@ -1509,6 +1496,10 @@ app.use((req, res, next) => {
         } catch (fallbackErr) {
           console.warn('Fallback slide PNG PPTX error:', fallbackErr);
         }
+
+        // If direct PPTX download was requested but not generated, redirect to Google Drive view
+        res.redirect(302, `https://drive.google.com/file/d/${encodeURIComponent(fileId)}/view`);
+        return;
       }
 
       // 3. Interactive Live Presentation Player (with 100% original animations) + Slide-by-Slide / PDF Print Viewer

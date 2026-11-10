@@ -358,6 +358,10 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
     e.preventDefault();
     if (downloadingFileIds.has(fileId)) return;
 
+    const cleanName =
+      (fileName || `Presentation_${fileId}`).replace(/\.(pptx|ppt)?$/i, '') + '.pptx';
+    const downloadUrl = `/api/download/file/${encodeURIComponent(fileId)}?name=${encodeURIComponent(cleanName)}`;
+
     setDownloadingFileIds((prev) => {
       const next = new Set(prev);
       next.add(fileId);
@@ -365,13 +369,29 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
     });
 
     try {
-      await downloadDriveFileAsPptx(fileId, fileName);
+      // Trigger native browser download directly via simulated <a> click
+      const a = document.createElement('a');
+      a.href = downloadUrl;
+      a.download = cleanName;
+      a.target = '_blank';
+      a.rel = 'noreferrer';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    } catch {
+      try {
+        await downloadDriveFileAsPptx(fileId, fileName);
+      } catch (err) {
+        console.warn('Fallback download error:', err);
+      }
     } finally {
-      setDownloadingFileIds((prev) => {
-        const next = new Set(prev);
-        next.delete(fileId);
-        return next;
-      });
+      window.setTimeout(() => {
+        setDownloadingFileIds((prev) => {
+          const next = new Set(prev);
+          next.delete(fileId);
+          return next;
+        });
+      }, 1200);
     }
   };
 
