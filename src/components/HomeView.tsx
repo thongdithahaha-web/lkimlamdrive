@@ -201,7 +201,36 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
 
       const contentType = startRes.headers.get('content-type') || '';
       if (startRes.ok && contentType.includes('application/json')) {
-        const { job_id } = await startRes.json();
+        const startData = await startRes.json();
+        const { job_id, job: immediateJob } = startData;
+
+        if (immediateJob && (immediateJob.status === 'completed' || immediateJob.status === 'error')) {
+          setJobState(immediateJob);
+          setDownloading(false);
+
+          if (immediateJob.status === 'completed' && currentUser) {
+            const filesList: ProcessedDriveFile[] = immediateJob.files || [];
+            const totalBytes = filesList.reduce((acc, f) => acc + (f.sizeBytes || 0), 0);
+            const resolvedName =
+              isFolder
+                ? `${immediateJob.folderTitle || folderTitle || 'Google Drive Folder'} (${filesList.length} files)`
+                : immediateJob.folderTitle || filesList[0]?.name || 'Google Drive File';
+
+            recordDownloadJob({
+              userId: currentUser.id,
+              username: currentUser.username,
+              fileName: resolvedName,
+              driveUrl: parsedUrl.normalizedUrl,
+              fileType: isFolder ? 'folder' : 'file',
+              fileCount: filesList.length || totalFilesCount,
+              sizeFormatted: totalBytes > 0 ? formatBytesVi(totalBytes) : 'Tệp Drive',
+              creditsUsed: creditsRequired,
+              status: 'completed',
+              destinationFolderLink: immediateJob.driveLink || parsedUrl.normalizedUrl,
+            });
+          }
+          return;
+        }
 
         timerRef.current = window.setInterval(async () => {
           try {

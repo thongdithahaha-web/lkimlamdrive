@@ -60,7 +60,7 @@ export async function fetchDriveFilesReal(
   }
 
   if (parsed.type === 'folder') {
-    const embedUrl = `https://drive.google.com/embeddedfolderview?id=${parsed.resourceId}#list`;
+    const embedUrl = `https://drive.google.com/embeddedfolderview?id=${parsed.resourceId}`;
     const mainUrl = `https://drive.google.com/drive/folders/${parsed.resourceId}?hl=vi`;
 
     const [embedHtml, mainHtml] = await Promise.all([
@@ -144,20 +144,38 @@ export async function fetchDriveFilesReal(
 }
 
 async function fetchViaCorsRelay(targetUrl: string): Promise<string> {
+  const cleanUrl = targetUrl.split('#')[0];
   const relays = [
-    `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`,
-    `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(targetUrl)}`,
+    `https://api.allorigins.win/raw?url=${encodeURIComponent(cleanUrl)}`,
+    `https://api.allorigins.win/get?url=${encodeURIComponent(cleanUrl)}`,
+    `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(cleanUrl)}`,
+    `https://corsproxy.io/?url=${encodeURIComponent(cleanUrl)}`,
   ];
-  for (const relay of relays) {
+
+  const attemptRelay = async (relayUrl: string): Promise<string> => {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 7000);
     try {
-      const res = await fetch(relay);
-      if (res.ok) {
-        const text = await res.text();
-        if (text && text.length > 100) return text;
+      const res = await fetch(relayUrl, { signal: controller.signal });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const text = await res.text();
+      if (relayUrl.includes('/get?url=')) {
+        const parsed = JSON.parse(text);
+        if (parsed && typeof parsed.contents === 'string' && parsed.contents.length > 100) {
+          return parsed.contents;
+        }
+        throw new Error('Empty JSON contents');
       }
-    } catch {
-      // try next relay
+      if (text && text.length > 100) return text;
+      throw new Error('Empty response');
+    } finally {
+      clearTimeout(timeoutId);
     }
+  };
+
+  try {
+    return await Promise.any(relays.map((r) => attemptRelay(r)));
+  } catch {
+    return '';
   }
-  return '';
 }

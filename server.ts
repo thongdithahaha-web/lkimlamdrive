@@ -248,15 +248,14 @@ async function getUnlockedViewerSession(fileId: string): Promise<ViewerSession |
   return session;
 }
 
-async function startServer() {
-  const app = express();
-  const PORT = 3000;
+export const app = express();
+const PORT = 3000;
 
-  // Layer 4: Payload Size Guard (64KB limit against memory exhaustion DDoS)
-  app.use(express.json({ limit: '64kb' }));
+// Layer 4: Payload Size Guard (64KB limit against memory exhaustion DDoS)
+app.use(express.json({ limit: '64kb' }));
 
-  // Layer 1-4: Multi-Layer Anti-DDoS, WAF, Concurrency & Sliding Window Rate Limiter
-  app.use((req, res, next) => {
+// Layer 1-4: Multi-Layer Anti-DDoS, WAF, Concurrency & Sliding Window Rate Limiter
+app.use((req, res, next) => {
     // Hardened HTTP Security Headers
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'SAMEORIGIN');
@@ -719,108 +718,76 @@ async function startServer() {
       }
 
       const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-      const initialJob: ActiveJob = {
-        id: jobId,
-        status: 'processing',
-        progress: 12,
-        message: 'Đang kết nối tới Google Drive & kiểm tra danh sách tệp thật...',
-        current: 0,
-        total: Array.isArray(selectedFileIds) ? selectedFileIds.length : 1,
-      };
-      jobs.set(jobId, initialJob);
+      let targetFiles: DriveFileItem[] = [];
+      let folderTitle = '';
 
-      res.json({ job_id: jobId });
-
-      (async () => {
-        try {
-          let targetFiles: DriveFileItem[] = [];
-          let folderTitle = '';
-
-          if (parsed.type === 'folder') {
-            const folderData = await fetchRealDriveFolder(
-              parsed.resourceId,
-              Number(costPerSingleFileCredit) || 1,
-              Number(costPerGbCredit) || 1
-            );
-            folderTitle = folderData.folderTitle;
-            if (Array.isArray(selectedFileIds) && selectedFileIds.length > 0) {
-              const idSet = new Set(selectedFileIds.map(String));
-              targetFiles = folderData.files.filter((f) => idSet.has(f.id));
-            } else {
-              targetFiles = folderData.files;
-            }
-          } else {
-            const single = await fetchRealSingleDriveFile(
-              parsed.resourceId,
-              Number(costPerSingleFileCredit) || 1,
-              Number(costPerGbCredit) || 1
-            );
-            folderTitle = single.name;
-            targetFiles = [single];
-          }
-
-          if (targetFiles.length === 0) {
-            jobs.set(jobId, {
-              id: jobId,
-              status: 'error',
-              progress: 0,
-              message: 'Không tìm thấy tệp nào để xử lý trong đường dẫn này.',
-              current: 0,
-              total: 0,
-            });
-            return;
-          }
-
-          const total = targetFiles.length;
-          jobs.set(jobId, {
-            id: jobId,
-            status: 'processing',
-            progress: 58,
-            message: `Đang mở khóa & tạo luồng tải VIP (.PPTX kèm đầy đủ hiệu ứng) cho ${total} file...`,
-            current: Math.max(1, Math.floor(total / 2)),
-            total,
-          });
-
-          await new Promise((r) => setTimeout(r, 350));
-
-          const enrichedFiles: ProcessedFileResult[] = targetFiles.map((f) => ({
-            ...f,
-            proxyDownloadUrl: `/api/download/file/${encodeURIComponent(f.id)}?name=${encodeURIComponent(f.name)}`,
-            viewerUnlockUrl: `/api/download/file/${encodeURIComponent(f.id)}?name=${encodeURIComponent(f.name)}&mode=viewer`,
-            driveViewUrl:
-              f.mimeType === 'application/vnd.google-apps.folder'
-                ? `https://drive.google.com/drive/folders/${f.id}`
-                : `https://drive.google.com/file/d/${f.id}/view`,
-          }));
-
-          const mainDriveLink =
-            parsed.type === 'folder'
-              ? `https://drive.google.com/drive/folders/${parsed.resourceId}`
-              : `https://drive.google.com/file/d/${parsed.resourceId}/view`;
-
-          jobs.set(jobId, {
-            id: jobId,
-            status: 'completed',
-            progress: 100,
-            message: `Hoàn tất! Đã mở khóa ${total} file từ "${folderTitle}" (Hỗ trợ tải .PPTX đầy đủ hiệu ứng & PDF)`,
-            current: total,
-            total,
-            driveLink: mainDriveLink,
-            folderTitle,
-            files: enrichedFiles,
-          });
-        } catch (err) {
-          console.error('Job processing error:', err);
-          jobs.set(jobId, {
-            id: jobId,
-            status: 'error',
-            progress: 0,
-            message: 'Lỗi xử lý tệp từ Google Drive. Vui lòng thử lại.',
-            current: 0,
-            total: 0,
-          });
+      if (parsed.type === 'folder') {
+        const folderData = await fetchRealDriveFolder(
+          parsed.resourceId,
+          Number(costPerSingleFileCredit) || 1,
+          Number(costPerGbCredit) || 1
+        );
+        folderTitle = folderData.folderTitle;
+        if (Array.isArray(selectedFileIds) && selectedFileIds.length > 0) {
+          const idSet = new Set(selectedFileIds.map(String));
+          targetFiles = folderData.files.filter((f) => idSet.has(f.id));
+        } else {
+          targetFiles = folderData.files;
         }
-      })();
+      } else {
+        const single = await fetchRealSingleDriveFile(
+          parsed.resourceId,
+          Number(costPerSingleFileCredit) || 1,
+          Number(costPerGbCredit) || 1
+        );
+        folderTitle = single.name;
+        targetFiles = [single];
+      }
+
+      if (targetFiles.length === 0) {
+        const errJob: ActiveJob = {
+          id: jobId,
+          status: 'error',
+          progress: 0,
+          message: 'Không tìm thấy tệp nào để xử lý trong đường dẫn này.',
+          current: 0,
+          total: 0,
+        };
+        jobs.set(jobId, errJob);
+        res.json({ job_id: jobId, job: errJob });
+        return;
+      }
+
+      const total = targetFiles.length;
+      const enrichedFiles: ProcessedFileResult[] = targetFiles.map((f) => ({
+        ...f,
+        proxyDownloadUrl: `/api/download/file/${encodeURIComponent(f.id)}?name=${encodeURIComponent(f.name)}`,
+        viewerUnlockUrl: `/api/download/file/${encodeURIComponent(f.id)}?name=${encodeURIComponent(f.name)}&mode=viewer`,
+        driveViewUrl:
+          f.mimeType === 'application/vnd.google-apps.folder'
+            ? `https://drive.google.com/drive/folders/${f.id}`
+            : `https://drive.google.com/file/d/${f.id}/view`,
+      }));
+
+      const mainDriveLink =
+        parsed.type === 'folder'
+          ? `https://drive.google.com/drive/folders/${parsed.resourceId}`
+          : `https://drive.google.com/file/d/${parsed.resourceId}/view`;
+
+      const completedJob: ActiveJob = {
+        id: jobId,
+        status: 'completed',
+        progress: 100,
+        message: `Hoàn tất! Đã mở khóa ${total} file từ "${folderTitle}" (Hỗ trợ tải .PPTX đầy đủ hiệu ứng & PDF)`,
+        current: total,
+        total,
+        driveLink: mainDriveLink,
+        folderTitle,
+        files: enrichedFiles,
+      };
+
+      jobs.set(jobId, completedJob);
+      res.json({ job_id: jobId, job: completedJob });
     } catch (err) {
       console.error('Error starting job:', err);
       res.status(500).json({ error: 'Không thể khởi tạo tiến trình tải' });
@@ -1028,6 +995,7 @@ async function startServer() {
     }
   });
 
+async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -1047,4 +1015,9 @@ async function startServer() {
   });
 }
 
-startServer();
+if (!process.env.VERCEL) {
+  startServer();
+}
+
+export default app;
+
