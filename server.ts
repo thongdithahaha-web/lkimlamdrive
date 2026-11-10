@@ -3,7 +3,6 @@ import crypto from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import nodemailer from 'nodemailer';
-import { createServer as createViteServer } from 'vite';
 import firebaseConfig from './firebase-applet-config.json';
 import { parseDriveUrl, DriveFileItem } from './src/utils/systemRules';
 import {
@@ -1426,29 +1425,31 @@ app.use((req, res, next) => {
           const deck = await fetchGoogleSlidesAnimatedDeck(fileId);
           if (deck && deck.slides.length > 0) {
             const pptxBuf = await buildAnimatedPptxBuffer(deck);
-            const cleanName =
-              (requestedName || deck.title || `Presentation_${fileId}`).replace(
-                /\.(pptx|ppt)?$/i,
-                ''
-              ) + '.pptx';
+            if (pptxBuf.length > 25000) {
+              const cleanName =
+                (requestedName || deck.title || `Presentation_${fileId}`).replace(
+                  /\.(pptx|ppt)?$/i,
+                  ''
+                ) + '.pptx';
 
-            pptxBufferCache.set(fileId, {
-              buffer: pptxBuf,
-              filename: cleanName,
-              expiresAt: Date.now() + 15 * 60 * 1000,
-            });
+              pptxBufferCache.set(fileId, {
+                buffer: pptxBuf,
+                filename: cleanName,
+                expiresAt: Date.now() + 15 * 60 * 1000,
+              });
 
-            res.setHeader(
-              'Content-Type',
-              'application/vnd.openxmlformats-officedocument.presentationml.presentation'
-            );
-            res.setHeader(
-              'Content-Disposition',
-              `attachment; filename*=UTF-8''${encodeURIComponent(cleanName)}`
-            );
-            res.setHeader('Content-Length', String(pptxBuf.length));
-            res.send(pptxBuf);
-            return;
+              res.setHeader(
+                'Content-Type',
+                'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+              );
+              res.setHeader(
+                'Content-Disposition',
+                `attachment; filename*=UTF-8''${encodeURIComponent(cleanName)}`
+              );
+              res.setHeader('Content-Length', String(pptxBuf.length));
+              res.send(pptxBuf);
+              return;
+            }
           }
         } catch (deckErr) {
           console.warn('Animated deck build fallback:', deckErr);
@@ -1595,6 +1596,7 @@ app.use((req, res, next) => {
 
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',

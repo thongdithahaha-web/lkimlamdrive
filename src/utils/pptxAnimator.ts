@@ -1,8 +1,19 @@
 import zlib from 'zlib';
-import { Resvg } from '@resvg/resvg-js';
 
 const CHROME_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
+let cachedResvgClass: any = undefined;
+async function getResvgClass(): Promise<any> {
+  if (cachedResvgClass !== undefined) return cachedResvgClass;
+  try {
+    const mod = await import('@resvg/resvg-js');
+    cachedResvgClass = mod.Resvg || (mod as any).default?.Resvg || null;
+  } catch {
+    cachedResvgClass = null;
+  }
+  return cachedResvgClass;
+}
 
 export interface AnimatedAction {
   targetId: string;
@@ -180,10 +191,10 @@ export async function fetchGoogleSlidesAnimatedDeck(
   const urlToDataUri = new Map<string, string>();
   await Promise.all(
     Array.from(imageUrls)
-      .slice(0, 60)
+      .slice(0, 45)
       .map(async (url) => {
         const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 3500);
+        const timer = setTimeout(() => controller.abort(), 2200);
         try {
           const imgRes = await fetch(url, {
             headers: { 'User-Agent': CHROME_UA },
@@ -320,9 +331,10 @@ const FALLBACK_1X1_PNG = Buffer.from(
   'base64'
 );
 
-function renderSvgToPngBuffer(svg: string, width = 960): Buffer {
+function renderSvgToPngBuffer(ResvgCtor: any, svg: string, width = 960): Buffer {
+  if (!ResvgCtor) return FALLBACK_1X1_PNG;
   try {
-    const resvg = new Resvg(svg, {
+    const resvg = new ResvgCtor(svg, {
       font: { loadSystemFonts: false },
       fitTo: { mode: 'width', value: width },
     });
@@ -543,6 +555,7 @@ export async function buildAnimatedPptxBuffer(deck: ParsedPresentationDeck): Pro
   );
 
   // 5. Generate each slide and its media assets
+  const ResvgCtor = await getResvgClass();
   let mediaCounter = 1;
   let rasterCount = 0;
 
@@ -558,24 +571,19 @@ export async function buildAnimatedPptxBuffer(deck: ParsedPresentationDeck): Pro
     // Base Slide Picture (spid = 2)
     const baseMediaId = mediaCounter++;
     const basePngName = `image${baseMediaId}.png`;
-    const baseSvgName = `svg${baseMediaId}.svg`;
     const basePngBuf =
-      rasterCount < 45 ? (rasterCount++, renderSvgToPngBuffer(slide.baseSvg, 960)) : FALLBACK_1X1_PNG;
+      rasterCount < 40
+        ? (rasterCount++, renderSvgToPngBuffer(ResvgCtor, slide.baseSvg, 960))
+        : FALLBACK_1X1_PNG;
     zipEntries.push({ name: `ppt/media/${basePngName}`, data: basePngBuf });
-    zipEntries.push({
-      name: `ppt/media/${baseSvgName}`,
-      data: Buffer.from(slide.baseSvg, 'utf-8'),
-    });
 
     const baseRIdPng = `rIdImg${baseMediaId}`;
-    const baseRIdSvg = `rIdSvg${baseMediaId}`;
     rels.push(
-      `<Relationship Id="${baseRIdPng}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/${basePngName}"/>`,
-      `<Relationship Id="${baseRIdSvg}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/${baseSvgName}"/>`
+      `<Relationship Id="${baseRIdPng}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/${basePngName}"/>`
     );
 
     picShapesXml.push(
-      buildPicShapeXml(2, `Slide_${slideNum}_Base`, baseRIdPng, baseRIdSvg)
+      buildPicShapeXml(2, `Slide_${slideNum}_Base`, baseRIdPng)
     );
 
     // Animated Element Overlay Pictures (spid = 3, 4, ...)
@@ -588,24 +596,19 @@ export async function buildAnimatedPptxBuffer(deck: ParsedPresentationDeck): Pro
 
       const elMediaId = mediaCounter++;
       const elPngName = `image${elMediaId}.png`;
-      const elSvgName = `svg${elMediaId}.svg`;
       const elPngBuf =
-        rasterCount < 45 ? (rasterCount++, renderSvgToPngBuffer(animEl.svg, 640)) : FALLBACK_1X1_PNG;
+        rasterCount < 40
+          ? (rasterCount++, renderSvgToPngBuffer(ResvgCtor, animEl.svg, 640))
+          : FALLBACK_1X1_PNG;
       zipEntries.push({ name: `ppt/media/${elPngName}`, data: elPngBuf });
-      zipEntries.push({
-        name: `ppt/media/${elSvgName}`,
-        data: Buffer.from(animEl.svg, 'utf-8'),
-      });
 
       const rIdPng = `rIdImg${elMediaId}`;
-      const rIdSvg = `rIdSvg${elMediaId}`;
       rels.push(
-        `<Relationship Id="${rIdPng}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/${elPngName}"/>`,
-        `<Relationship Id="${rIdSvg}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/${elSvgName}"/>`
+        `<Relationship Id="${rIdPng}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/${elPngName}"/>`
       );
 
       picShapesXml.push(
-        buildPicShapeXml(spid, `Anim_${animEl.targetId}`, rIdPng, rIdSvg)
+        buildPicShapeXml(spid, `Anim_${animEl.targetId}`, rIdPng)
       );
     }
 
@@ -843,8 +846,7 @@ export function buildPptxFromSlidePngs(slideBuffers: Buffer[]): Buffer {
 function buildPicShapeXml(
   spid: number,
   name: string,
-  rIdPng: string,
-  rIdSvg: string
+  rIdPng: string
 ): string {
   const safeName = escapeXmlAttr(name);
   return `<p:pic>
@@ -856,13 +858,7 @@ function buildPicShapeXml(
           <p:nvPr/>
         </p:nvPicPr>
         <p:blipFill>
-          <a:blip r:embed="${rIdPng}">
-            <a:extLst>
-              <a:ext uri="{96DAC541-7B7A-43D3-8B79-37D633B846F1}">
-                <asvg:svgBlip xmlns:asvg="http://schemas.microsoft.com/office/drawing/2016/svg/main" r:embed="${rIdSvg}"/>
-              </a:ext>
-            </a:extLst>
-          </a:blip>
+          <a:blip r:embed="${rIdPng}"/>
           <a:stretch>
             <a:fillRect/>
           </a:stretch>

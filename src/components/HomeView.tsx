@@ -23,6 +23,7 @@ import {
 import {
   fetchDriveFilesReal,
   ProcessedDriveFile,
+  downloadDriveFileAsPptx,
 } from '../utils/clientDriveApi';
 import { formatBytesVi } from '../utils/driveScraper';
 
@@ -43,6 +44,8 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
   const [showFolderList, setShowFolderList] = useState(false);
 
   const [downloading, setDownloading] = useState(false);
+  const [downloadingFileIds, setDownloadingFileIds] = useState<Set<string>>(new Set());
+  const [viewerModalFile, setViewerModalFile] = useState<{ id: string; name: string } | null>(null);
   const [jobState, setJobState] = useState<{
     status: 'processing' | 'completed' | 'error';
     progress: number;
@@ -346,6 +349,32 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
     setSelectedIds(next);
   };
 
+  const handleDirectPptxDownload = async (
+    e: React.MouseEvent,
+    fileId: string,
+    fileName: string
+  ) => {
+    e.stopPropagation();
+    e.preventDefault();
+    if (downloadingFileIds.has(fileId)) return;
+
+    setDownloadingFileIds((prev) => {
+      const next = new Set(prev);
+      next.add(fileId);
+      return next;
+    });
+
+    try {
+      await downloadDriveFileAsPptx(fileId, fileName);
+    } finally {
+      setDownloadingFileIds((prev) => {
+        const next = new Set(prev);
+        next.delete(fileId);
+        return next;
+      });
+    }
+  };
+
   return (
     <div className="relative min-h-screen w-full overflow-y-auto bg-black pb-20 text-white">
       <DiagonalRibbonsBackground />
@@ -562,26 +591,36 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
                           </div>
 
                           <div className="flex items-center gap-1.5 shrink-0">
-                            <a
-                              href={`/api/download/file/${encodeURIComponent(file.id)}?name=${encodeURIComponent(file.name)}`}
-                              download={file.name}
-                              onClick={(e) => e.stopPropagation()}
-                              className="text-xs bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/30 text-emerald-300 px-3 py-1.5 rounded-lg font-medium shrink-0 inline-flex items-center gap-1.5 transition-colors"
+                            <button
+                              type="button"
+                              disabled={downloadingFileIds.has(file.id)}
+                              onClick={(e) => handleDirectPptxDownload(e, file.id, file.name)}
+                              className="text-xs bg-emerald-500/20 hover:bg-emerald-500/30 disabled:opacity-60 border border-emerald-500/30 text-emerald-300 px-3 py-1.5 rounded-lg font-medium shrink-0 inline-flex items-center gap-1.5 transition-colors cursor-pointer"
                               title={`Tải file ${file.name} (.PPTX kèm đầy đủ hiệu ứng)`}
                             >
-                              <Download className="h-3.5 w-3.5" />
-                              <span>Tải .PPTX (Đủ Hiệu Ứng)</span>
-                            </a>
-                            <a
-                              href={`/api/download/file/${encodeURIComponent(file.id)}?name=${encodeURIComponent(file.name)}&mode=viewer`}
-                              target="_blank"
-                              rel="noreferrer"
-                              onClick={(e) => e.stopPropagation()}
-                              className="text-xs bg-white/10 hover:bg-white/20 text-white px-2.5 py-1.5 rounded-lg font-medium shrink-0 inline-flex items-center gap-1 transition-colors"
+                              {downloadingFileIds.has(file.id) ? (
+                                <>
+                                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                  <span>Đang tải .PPTX...</span>
+                                </>
+                              ) : (
+                                <>
+                                  <Download className="h-3.5 w-3.5" />
+                                  <span>Tải .PPTX (Đủ Hiệu Ứng)</span>
+                                </>
+                              )}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setViewerModalFile({ id: file.id, name: file.name });
+                              }}
+                              className="text-xs bg-white/10 hover:bg-white/20 text-white px-2.5 py-1.5 rounded-lg font-medium shrink-0 inline-flex items-center gap-1 transition-colors cursor-pointer"
                               title="Trình chiếu hiệu ứng trực tiếp hoặc xuất PDF"
                             >
                               <span>Slide / PDF</span>
-                            </a>
+                            </button>
                           </div>
                         </div>
                       ))}
@@ -663,23 +702,32 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
                             </div>
                           </div>
                           <div className="flex items-center gap-2 shrink-0">
-                            <a
-                              href={f.proxyDownloadUrl}
-                              download={f.name}
-                              className="bg-emerald-500 hover:bg-emerald-400 text-black font-semibold px-3.5 py-1.5 rounded-lg text-xs inline-flex items-center gap-1.5 transition-colors"
+                            <button
+                              type="button"
+                              disabled={downloadingFileIds.has(f.id)}
+                              onClick={(e) => handleDirectPptxDownload(e, f.id, f.name)}
+                              className="bg-emerald-500 hover:bg-emerald-400 disabled:opacity-60 text-black font-semibold px-3.5 py-1.5 rounded-lg text-xs inline-flex items-center gap-1.5 transition-colors cursor-pointer"
                             >
-                              <Download className="h-3.5 w-3.5" />
-                              <span>Tải .PPTX (Đầy Đủ Hiệu Ứng)</span>
-                            </a>
-                            <a
-                              href={`${f.proxyDownloadUrl}&mode=viewer`}
-                              target="_blank"
-                              rel="noreferrer"
-                              className="bg-white/10 hover:bg-white/20 text-white px-3 py-1.5 rounded-lg text-xs inline-flex items-center gap-1 transition-colors"
+                              {downloadingFileIds.has(f.id) ? (
+                                <>
+                                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                  <span>Đang tải .PPTX...</span>
+                                </>
+                              ) : (
+                                <>
+                                  <Download className="h-3.5 w-3.5" />
+                                  <span>Tải .PPTX (Đầy Đủ Hiệu Ứng)</span>
+                                </>
+                              )}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setViewerModalFile({ id: f.id, name: f.name })}
+                              className="bg-white/10 hover:bg-white/20 text-white px-3 py-1.5 rounded-lg text-xs inline-flex items-center gap-1 transition-colors cursor-pointer"
                               title="Trình chiếu trực tiếp kèm hiệu ứng hoặc xuất PDF"
                             >
                               <span>Trình Chiếu / PDF</span>
-                            </a>
+                            </button>
                             <a
                               href={f.driveViewUrl}
                               target="_blank"
@@ -747,6 +795,66 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
           </div>
         </div>
       </div>
+
+      {/* Interactive Presentation & Slide Player Modal */}
+      {viewerModalFile && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 backdrop-blur-md p-4"
+          onClick={() => setViewerModalFile(null)}
+        >
+          <div
+            className="w-full max-w-5xl rounded-2xl border border-white/15 bg-[#0b1120] overflow-hidden shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 px-5 py-3.5">
+              <div className="min-w-0">
+                <h3 className="text-sm font-bold text-white truncate">{viewerModalFile.name}</h3>
+                <p className="text-xs text-emerald-400">
+                  Nhấn vào Slide hoặc phím mũi tên → để chạy từng hiệu ứng động
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  disabled={downloadingFileIds.has(viewerModalFile.id)}
+                  onClick={(e) =>
+                    handleDirectPptxDownload(e, viewerModalFile.id, viewerModalFile.name)
+                  }
+                  className="bg-emerald-500 hover:bg-emerald-400 disabled:opacity-60 text-black font-bold px-3.5 py-1.5 rounded-lg text-xs inline-flex items-center gap-1.5 cursor-pointer"
+                >
+                  {downloadingFileIds.has(viewerModalFile.id) ? (
+                    <>
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      <span>Đang tải .PPTX...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Download className="h-3.5 w-3.5" />
+                      <span>Tải .PPTX</span>
+                    </>
+                  )}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setViewerModalFile(null)}
+                  className="bg-white/10 hover:bg-white/20 text-white px-3 py-1.5 rounded-lg text-xs font-semibold cursor-pointer"
+                >
+                  Đóng ✕
+                </button>
+              </div>
+            </div>
+            <div className="w-full aspect-video bg-black">
+              <iframe
+                src={`https://docs.google.com/presentation/d/${encodeURIComponent(viewerModalFile.id)}/embed?start=false&loop=false&delayms=3000`}
+                title={viewerModalFile.name}
+                className="w-full h-full border-0"
+                allowFullScreen
+              />
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
+
