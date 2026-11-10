@@ -183,6 +183,8 @@ function getInternalFirebasePass(email: string): string {
  * Dispatches Firebase email where the 6-digit OTP is placed in the separate greeting line
  * (`displayName`) rather than glued onto the URL, keeping the OTP code and the action link separate.
  */
+const knownFirebasePasswords = new Map<string, string>();
+
 async function sendFirebaseEmailSeparateOtpAndLink(params: {
   to: string;
   username: string;
@@ -195,12 +197,16 @@ async function sendFirebaseEmailSeparateOtpAndLink(params: {
 
   const cleanEmail = params.to.trim().toLowerCase();
   const internalPass = getInternalFirebasePass(cleanEmail);
-  const targetPassword =
-    params.userPassword && params.userPassword.length >= 6 ? params.userPassword : internalPass;
-  const displayGreeting = `${params.username || cleanEmail.split('@')[0]} — [MÃ OTP 6 SỐ: ${params.code}]`;
+  if (params.userPassword && params.userPassword.length >= 6) {
+    knownFirebasePasswords.set(cleanEmail, params.userPassword);
+  }
+  const otpLabel =
+    params.purpose === 'reset-password' ? 'MÃ OTP ĐẶT LẠI MẬT KHẨU 6 SỐ' : 'MÃ OTP XÁC MINH 6 SỐ';
+  const displayGreeting = `${params.username || cleanEmail.split('@')[0]} — [${otpLabel}: ${params.code}]`;
   const candidatePasswords = [
-    params.userPassword,
     internalPass,
+    params.userPassword,
+    knownFirebasePasswords.get(cleanEmail),
     'admin',
     '123456',
   ].filter((p): p is string => Boolean(p && p.length >= 6));
@@ -208,7 +214,7 @@ async function sendFirebaseEmailSeparateOtpAndLink(params: {
   try {
     let idToken = '';
 
-    // 1. Try creating account with displayGreeting containing the separate 6-digit OTP
+    // 1. Try creating account with deterministic internalPass and displayGreeting containing the 6-digit OTP
     const signUpRes = await fetch(
       `https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=${apiKey}`,
       {
@@ -216,7 +222,7 @@ async function sendFirebaseEmailSeparateOtpAndLink(params: {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           email: cleanEmail,
-          password: targetPassword,
+          password: internalPass,
           displayName: displayGreeting,
           returnSecureToken: true,
         }),
@@ -227,8 +233,8 @@ async function sendFirebaseEmailSeparateOtpAndLink(params: {
       idToken = signUpData.idToken;
     } else {
       // 2. Account already exists: sign in, reset unverified state via delete+signUp so VERIFY_EMAIL
-      // always sends the template containing Line 1: "Xin chào <username> — [MÃ OTP 6 SỐ: 123456],"
-      // and Line 3: the separate verification/recovery link.
+      // always sends the template containing Line 1: "Xin chào <username> — [MÃ OTP ...: 123456]!"
+      // (Firebase's PASSWORD_RESET template hardcodes "Xin chào!" without %DISPLAY_NAME%, whereas VERIFY_EMAIL includes %DISPLAY_NAME%).
       for (const pass of candidatePasswords) {
         const signInRes = await fetch(
           `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${apiKey}`,
@@ -265,7 +271,7 @@ async function sendFirebaseEmailSeparateOtpAndLink(params: {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               email: cleanEmail,
-              password: targetPassword,
+              password: internalPass,
               displayName: displayGreeting,
               returnSecureToken: true,
             }),
