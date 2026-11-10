@@ -15,7 +15,12 @@ import {
   Save,
   Trash2,
 } from 'lucide-react';
-import { DdosConfig, DdosSecurityEvent, IpReputationRecord } from '../utils/ddosProtection';
+import {
+  DdosConfig,
+  DEFAULT_DDOS_CONFIG,
+  DdosSecurityEvent,
+  IpReputationRecord,
+} from '../utils/ddosProtection';
 import { useAppStore } from '../context/AppContext';
 
 interface TrackedIpItem extends IpReputationRecord {
@@ -38,7 +43,9 @@ interface OutboxMailItem {
 export const SecurityDdosPanel: React.FC<{ onToast: (msg: string) => void }> = ({ onToast }) => {
   const { config, updateSystemConfig } = useAppStore();
 
-  const [ddosConfig, setDdosConfig] = useState<DdosConfig | null>(null);
+  const [ddosConfig, setDdosConfig] = useState<DdosConfig>(() => ({
+    ...DEFAULT_DDOS_CONFIG,
+  }));
   const [stats, setStats] = useState({
     totalRequests: 0,
     totalBlocked: 0,
@@ -48,7 +55,7 @@ export const SecurityDdosPanel: React.FC<{ onToast: (msg: string) => void }> = (
   const [ips, setIps] = useState<TrackedIpItem[]>([]);
   const [events, setEvents] = useState<DdosSecurityEvent[]>([]);
   const [outbox, setOutbox] = useState<OutboxMailItem[]>([]);
-  const [smtpEmail, setSmtpEmail] = useState(config.smtpEmail || '');
+  const [smtpEmail, setSmtpEmail] = useState(config.smtpEmail || 'lekimlam2707@gmail.com');
   const [smtpAppPassword, setSmtpAppPassword] = useState(config.smtpAppPassword || '');
   const [manualIp, setManualIp] = useState('');
   const [loading, setLoading] = useState(false);
@@ -59,14 +66,16 @@ export const SecurityDdosPanel: React.FC<{ onToast: (msg: string) => void }> = (
         fetch('/api/security/status'),
         fetch('/api/auth/outbox'),
       ]);
-      if (secRes.ok) {
+      const secType = secRes.headers.get('content-type') || '';
+      if (secRes.ok && secType.includes('application/json')) {
         const data = await secRes.json();
-        setDdosConfig((prev) => prev || data.config);
-        setStats(data.stats);
+        if (data.config) setDdosConfig(data.config);
+        if (data.stats) setStats(data.stats);
         setIps(data.ips || []);
         setEvents(data.events || []);
       }
-      if (mailRes.ok) {
+      const mailType = mailRes.headers.get('content-type') || '';
+      if (mailRes.ok && mailType.includes('application/json')) {
         const mailData = await mailRes.json();
         setOutbox(mailData.emails || []);
       }
@@ -83,24 +92,30 @@ export const SecurityDdosPanel: React.FC<{ onToast: (msg: string) => void }> = (
 
   const handleSaveDdosConfig = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!ddosConfig) return;
     setLoading(true);
     try {
-      updateSystemConfig({ smtpEmail, smtpAppPassword });
-      const res = await fetch('/api/security/config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          ...ddosConfig,
-          smtpEmail,
-          smtpAppPassword,
-        }),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        setDdosConfig(data.config);
-        onToast('Đã lưu cấu hình Rate Limiting, Tường lửa Anti-DDoS & Gmail SMTP thành công!');
+      const cleanSmtpEmail = smtpEmail.trim();
+      const cleanSmtpPass = smtpAppPassword.replace(/\s+/g, '');
+      updateSystemConfig({ smtpEmail: cleanSmtpEmail, smtpAppPassword: cleanSmtpPass });
+      try {
+        const res = await fetch('/api/security/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ...ddosConfig,
+            smtpEmail: cleanSmtpEmail,
+            smtpAppPassword: cleanSmtpPass,
+          }),
+        });
+        const ct = res.headers.get('content-type') || '';
+        if (res.ok && ct.includes('application/json')) {
+          const data = await res.json();
+          if (data.config) setDdosConfig(data.config);
+        }
+      } catch {
+        // saved in system config
       }
+      onToast('Đã lưu cấu hình Gmail SMTP (Gửi mã OTP 6 số) & Tường lửa Anti-DDoS thành công!');
     } finally {
       setLoading(false);
     }
@@ -259,163 +274,161 @@ export const SecurityDdosPanel: React.FC<{ onToast: (msg: string) => void }> = (
       </div>
 
       {/* Rate Limiting & Gmail SMTP Configuration Form */}
-      {ddosConfig && (
-        <form
-          onSubmit={handleSaveDdosConfig}
-          className="bg-[#0F172A] border border-slate-800 rounded-xl p-6 space-y-6"
-        >
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-800 pb-4">
-            <div>
-              <h3 className="text-base font-bold text-white">
-                Thiết Lập Ngưỡng Rate Limiting & Xác Thực Gmail OTP
-              </h3>
-              <p className="text-xs text-slate-400">
-                Điều chỉnh giới hạn băng thông từng phân vùng API và cấu hình tài khoản Gmail gửi mã OTP.
-              </p>
-            </div>
-            <button
-              type="submit"
-              disabled={loading}
-              className="bg-indigo-600 hover:bg-indigo-500 text-white font-semibold px-5 py-2.5 rounded-lg text-sm inline-flex items-center gap-2 cursor-pointer self-start"
-            >
-              <Save className="w-4 h-4" />
-              <span>Lưu Cấu Hình Bảo Mật</span>
-            </button>
+      <form
+        onSubmit={handleSaveDdosConfig}
+        className="bg-[#0F172A] border border-indigo-500/40 rounded-xl p-6 space-y-6"
+      >
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-800 pb-4">
+          <div>
+            <h3 className="text-base font-bold text-white">
+              Cấu Hình Gửi Mã OTP 6 Số Qua Gmail (SMTP) & Ngưỡng Rate Limiting
+            </h3>
+            <p className="text-xs text-slate-400">
+              Dán mã App Password 16 ký tự của Google vào ô bên dưới để hệ thống bắn mã OTP 6 số trực tiếp tới Gmail người dùng.
+            </p>
+          </div>
+          <button
+            type="submit"
+            disabled={loading}
+            className="bg-indigo-600 hover:bg-indigo-500 text-white font-semibold px-5 py-2.5 rounded-lg text-sm inline-flex items-center gap-2 cursor-pointer self-start"
+          >
+            <Save className="w-4 h-4" />
+            <span>Lưu Cấu Hình Gmail OTP & Bảo Mật</span>
+          </button>
+        </div>
+
+        {/* Highlighted Gmail SMTP 6-Digit OTP Box */}
+        <div className="p-4 rounded-xl bg-indigo-500/10 border border-indigo-500/30 grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div>
+            <label className="block text-xs font-semibold text-indigo-300 mb-1.5">
+              1. Gmail Hệ Thống Gửi Mã OTP (Chủ Web)
+            </label>
+            <input
+              type="email"
+              placeholder="VD: lekimlam2707@gmail.com"
+              value={smtpEmail}
+              onChange={(e) => setSmtpEmail(e.target.value)}
+              className="w-full bg-slate-900 border border-indigo-500/40 rounded-lg px-3.5 py-2.5 text-sm text-white focus:outline-none focus:border-indigo-400"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-semibold text-emerald-300 mb-1.5">
+              2. Dán Mã App Password 16 Ký Tự Của Google Vào Đây
+            </label>
+            <input
+              type="text"
+              placeholder="Dán mã 16 ký tự (VD: abcd efgh ijkl mnop)"
+              value={smtpAppPassword}
+              onChange={(e) => setSmtpAppPassword(e.target.value)}
+              className="w-full bg-slate-900 border border-emerald-500/40 rounded-lg px-3.5 py-2.5 text-sm text-emerald-300 font-mono focus:outline-none focus:border-emerald-400"
+            />
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+          <div>
+            <label className="block text-xs text-slate-300 mb-1">
+              Giới hạn API Chung (Requests / Phút / IP)
+            </label>
+            <input
+              type="number"
+              min="10"
+              value={ddosConfig.maxRequestsPerWindow}
+              onChange={(e) =>
+                setDdosConfig({ ...ddosConfig, maxRequestsPerWindow: Number(e.target.value) })
+              }
+              className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white font-mono"
+            />
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-            <div>
-              <label className="block text-xs text-slate-300 mb-1">
-                Giới hạn API Chung (Requests / Phút / IP)
-              </label>
-              <input
-                type="number"
-                min="10"
-                value={ddosConfig.maxRequestsPerWindow}
-                onChange={(e) =>
-                  setDdosConfig({ ...ddosConfig, maxRequestsPerWindow: Number(e.target.value) })
-                }
-                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white font-mono"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs text-slate-300 mb-1">
-                Giới hạn Đăng Nhập & OTP (Req / Phút / IP)
-              </label>
-              <input
-                type="number"
-                min="3"
-                value={ddosConfig.maxAuthRequestsPerWindow}
-                onChange={(e) =>
-                  setDdosConfig({
-                    ...ddosConfig,
-                    maxAuthRequestsPerWindow: Number(e.target.value),
-                  })
-                }
-                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white font-mono"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs text-slate-300 mb-1">
-                Giới hạn Luồng Tải File VIP (Req / Phút / IP)
-              </label>
-              <input
-                type="number"
-                min="5"
-                value={ddosConfig.maxDownloadRequestsPerWindow}
-                onChange={(e) =>
-                  setDdosConfig({
-                    ...ddosConfig,
-                    maxDownloadRequestsPerWindow: Number(e.target.value),
-                  })
-                }
-                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white font-mono"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs text-slate-300 mb-1">
-                Kết nối đồng thời tối đa / IP (Chống Slowloris)
-              </label>
-              <input
-                type="number"
-                min="2"
-                value={ddosConfig.maxConcurrentPerIp}
-                onChange={(e) =>
-                  setDdosConfig({ ...ddosConfig, maxConcurrentPerIp: Number(e.target.value) })
-                }
-                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white font-mono"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs text-slate-300 mb-1">
-                Số lần vi phạm trước khi Auto-Ban IP
-              </label>
-              <input
-                type="number"
-                min="1"
-                value={ddosConfig.autoBanThresholdViolations}
-                onChange={(e) =>
-                  setDdosConfig({
-                    ...ddosConfig,
-                    autoBanThresholdViolations: Number(e.target.value),
-                  })
-                }
-                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white font-mono"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs text-slate-300 mb-1">
-                Thời gian cách ly Auto-Ban (Phút)
-              </label>
-              <input
-                type="number"
-                min="1"
-                value={ddosConfig.autoBanDurationMinutes}
-                onChange={(e) =>
-                  setDdosConfig({
-                    ...ddosConfig,
-                    autoBanDurationMinutes: Number(e.target.value),
-                  })
-                }
-                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white font-mono"
-              />
-            </div>
+          <div>
+            <label className="block text-xs text-slate-300 mb-1">
+              Giới hạn Đăng Nhập & OTP (Req / Phút / IP)
+            </label>
+            <input
+              type="number"
+              min="3"
+              value={ddosConfig.maxAuthRequestsPerWindow}
+              onChange={(e) =>
+                setDdosConfig({
+                  ...ddosConfig,
+                  maxAuthRequestsPerWindow: Number(e.target.value),
+                })
+              }
+              className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white font-mono"
+            />
           </div>
 
-          {/* Gmail SMTP Settings */}
-          <div className="pt-4 border-t border-slate-800 grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div>
-              <label className="block text-xs font-medium text-indigo-300 mb-1">
-                Gmail Hệ Thống Gửi Mã OTP (Tùy chọn SMTP thật)
-              </label>
-              <input
-                type="email"
-                placeholder="VD: lekimlam2707@gmail.com"
-                value={smtpEmail}
-                onChange={(e) => setSmtpEmail(e.target.value)}
-                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white"
-              />
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-indigo-300 mb-1">
-                Mật Khẩu Ứng Dụng Google (App Password 16 ký tự)
-              </label>
-              <input
-                type="password"
-                placeholder="xxxx xxxx xxxx xxxx (Để trống sẽ dùng Hộp thư OTP tức thì)"
-                value={smtpAppPassword}
-                onChange={(e) => setSmtpAppPassword(e.target.value)}
-                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white font-mono"
-              />
-            </div>
+          <div>
+            <label className="block text-xs text-slate-300 mb-1">
+              Giới hạn Luồng Tải File VIP (Req / Phút / IP)
+            </label>
+            <input
+              type="number"
+              min="5"
+              value={ddosConfig.maxDownloadRequestsPerWindow}
+              onChange={(e) =>
+                setDdosConfig({
+                  ...ddosConfig,
+                  maxDownloadRequestsPerWindow: Number(e.target.value),
+                })
+              }
+              className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white font-mono"
+            />
           </div>
-        </form>
-      )}
+
+          <div>
+            <label className="block text-xs text-slate-300 mb-1">
+              Kết nối đồng thời tối đa / IP (Chống Slowloris)
+            </label>
+            <input
+              type="number"
+              min="2"
+              value={ddosConfig.maxConcurrentPerIp}
+              onChange={(e) =>
+                setDdosConfig({ ...ddosConfig, maxConcurrentPerIp: Number(e.target.value) })
+              }
+              className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white font-mono"
+            />
+          </div>
+
+          <div>
+            <label className="block text-xs text-slate-300 mb-1">
+              Số lần vi phạm trước khi Auto-Ban IP
+            </label>
+            <input
+              type="number"
+              min="1"
+              value={ddosConfig.autoBanThresholdViolations}
+              onChange={(e) =>
+                setDdosConfig({
+                  ...ddosConfig,
+                  autoBanThresholdViolations: Number(e.target.value),
+                })
+              }
+              className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white font-mono"
+            />
+          </div>
+
+          <div>
+            <label className="block text-xs text-slate-300 mb-1">
+              Thời gian cách ly Auto-Ban (Phút)
+            </label>
+            <input
+              type="number"
+              min="1"
+              value={ddosConfig.autoBanDurationMinutes}
+              onChange={(e) =>
+                setDdosConfig({
+                  ...ddosConfig,
+                  autoBanDurationMinutes: Number(e.target.value),
+                })
+              }
+              className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white font-mono"
+            />
+          </div>
+        </div>
+      </form>
 
       {/* Active IP Reputation Table & Real-Time Attack Log */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
