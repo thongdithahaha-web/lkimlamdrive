@@ -1,0 +1,219 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Pillar 1: Global Default-Deny Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Hardened Global Primitives
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isVerifiedUser() && (
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid)) ||
+        request.auth.token.email == 'lekimlam2707@gmail.com'
+      );
+    }
+
+    // Validation Blueprint: UserProfile
+    function isValidUserProfile(data) {
+      return data.keys().hasAll([
+          'uid',
+          'username',
+          'email',
+          'role',
+          'credits',
+          'balanceVnd',
+          'totalDepositedVnd',
+          'totalDownloadedFiles',
+          'status',
+          'emailVerified',
+          'authProvider',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'uid',
+          'username',
+          'email',
+          'role',
+          'credits',
+          'balanceVnd',
+          'totalDepositedVnd',
+          'totalDownloadedFiles',
+          'status',
+          'emailVerified',
+          'authProvider',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128 && data.uid.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.username is string && data.username.size() >= 2 && data.username.size() <= 64 &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 120 &&
+        data.role is string && data.role in ['user', 'vip', 'admin'] &&
+        data.credits is number && data.credits >= 0 && data.credits <= 100000000 &&
+        data.balanceVnd is number && data.balanceVnd >= 0 && data.balanceVnd <= 100000000000 &&
+        data.totalDepositedVnd is number && data.totalDepositedVnd >= 0 && data.totalDepositedVnd <= 100000000000 &&
+        data.totalDownloadedFiles is number && data.totalDownloadedFiles >= 0 && data.totalDownloadedFiles <= 10000000 &&
+        data.status is string && data.status in ['active', 'banned'] &&
+        data.emailVerified is bool &&
+        data.authProvider is string && data.authProvider in ['google', 'password'] &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    // Validation Blueprint: DownloadRecord
+    function isValidDownloadRecord(data) {
+      return data.keys().hasAll([
+          'userId',
+          'username',
+          'fileName',
+          'driveUrl',
+          'fileType',
+          'fileCount',
+          'sizeFormatted',
+          'creditsUsed',
+          'status',
+          'destinationFolderLink',
+          'createdAt'
+        ]) &&
+        data.keys().hasOnly([
+          'userId',
+          'username',
+          'fileName',
+          'driveUrl',
+          'fileType',
+          'fileCount',
+          'sizeFormatted',
+          'creditsUsed',
+          'status',
+          'destinationFolderLink',
+          'createdAt'
+        ]) &&
+        data.userId is string && data.userId.size() >= 1 && data.userId.size() <= 128 && data.userId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.username is string && data.username.size() >= 1 && data.username.size() <= 64 &&
+        data.fileName is string && data.fileName.size() >= 1 && data.fileName.size() <= 256 &&
+        data.driveUrl is string && data.driveUrl.size() >= 1 && data.driveUrl.size() <= 512 &&
+        data.fileType is string && data.fileType in ['file', 'folder'] &&
+        data.fileCount is number && data.fileCount >= 1 && data.fileCount <= 5000 &&
+        data.sizeFormatted is string && data.sizeFormatted.size() >= 1 && data.sizeFormatted.size() <= 64 &&
+        data.creditsUsed is number && data.creditsUsed >= 0 && data.creditsUsed <= 1000000 &&
+        data.status is string && data.status in ['processing', 'completed', 'error'] &&
+        data.destinationFolderLink is string && data.destinationFolderLink.size() >= 1 && data.destinationFolderLink.size() <= 512 &&
+        data.createdAt is timestamp;
+    }
+
+    // Validation Blueprint: AdminMarker
+    function isValidAdminMarker(data) {
+      return data.keys().hasAll(['uid', 'email', 'createdAt']) &&
+        data.keys().hasOnly(['uid', 'email', 'createdAt']) &&
+        data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128 && data.uid.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 120 &&
+        data.createdAt is timestamp;
+    }
+
+    // Collection: /users/{userId}
+    match /users/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isSignedIn() && (existing().uid == request.auth.uid || isAdmin());
+
+      allow create: if isVerifiedUser() &&
+        isValidId(userId) &&
+        isValidUserProfile(incoming()) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        (
+          (
+            isOwner(userId) &&
+            incoming().uid == request.auth.uid &&
+            incoming().role == 'user' &&
+            incoming().status == 'active' &&
+            incoming().credits <= 10 &&
+            incoming().balanceVnd == 0 &&
+            incoming().totalDepositedVnd == 0 &&
+            incoming().totalDownloadedFiles == 0
+          ) ||
+          isAdmin()
+        );
+
+      allow update: if isVerifiedUser() &&
+        isValidId(userId) &&
+        isValidUserProfile(incoming()) &&
+        incoming().uid == existing().uid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          (
+            isOwner(userId) &&
+            existing().status == 'active' &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['username', 'updatedAt'])
+          ) ||
+          isAdmin()
+        );
+
+      allow delete: if isAdmin() && isValidId(userId);
+    }
+
+    // Collection: /downloads/{downloadId}
+    match /downloads/{downloadId} {
+      allow get: if isSignedIn() && isValidId(downloadId) && (existing().userId == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && (existing().userId == request.auth.uid || isAdmin());
+
+      allow create: if isVerifiedUser() &&
+        isValidId(downloadId) &&
+        isValidDownloadRecord(incoming()) &&
+        incoming().userId == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid));
+
+      allow update: if isVerifiedUser() &&
+        isValidId(downloadId) &&
+        isValidDownloadRecord(incoming()) &&
+        incoming().userId == existing().userId &&
+        incoming().createdAt == existing().createdAt &&
+        (
+          (
+            existing().userId == request.auth.uid &&
+            existing().status == 'processing' &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'destinationFolderLink'])
+          ) ||
+          isAdmin()
+        );
+
+      allow delete: if isAdmin() && isValidId(downloadId);
+    }
+
+    // Collection: /admins/{adminId}
+    match /admins/{adminId} {
+      allow get: if isSignedIn() && isValidId(adminId) && (isOwner(adminId) || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isAdmin() && isValidId(adminId) && isValidAdminMarker(incoming()) && incoming().createdAt == request.time;
+      allow update: if isAdmin() && isValidId(adminId) && isValidAdminMarker(incoming()) && incoming().uid == existing().uid && incoming().createdAt == existing().createdAt;
+      allow delete: if isAdmin() && isValidId(adminId);
+    }
+  }
+}

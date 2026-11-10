@@ -1,0 +1,6 @@
+{
+  "name": "LKimLamDrive - Hệ thống Get Link VIP Google Drive",
+  "description": "LKimLamDrive là hệ thống proxy download an toàn, vượt qua mọi giới hạn tải xuống của Google Drive. Tốc độ cực nhanh, bảo mật 100%, tích hợp trang quản trị hệ thống.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

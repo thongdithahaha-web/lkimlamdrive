@@ -1,0 +1,198 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "User account stored in Firestore with role, credits, VND balance, and verification state.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID matching the document ID",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "username": {
+          "type": "string",
+          "description": "Unique display username",
+          "minLength": 2,
+          "maxLength": 64
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "Verified user email address",
+          "minLength": 3,
+          "maxLength": 120
+        },
+        "role": {
+          "type": "string",
+          "enum": ["user", "vip", "admin"],
+          "description": "Account privilege tier"
+        },
+        "credits": {
+          "type": "number",
+          "description": "Available download credits"
+        },
+        "balanceVnd": {
+          "type": "number",
+          "description": "Current VND wallet balance"
+        },
+        "totalDepositedVnd": {
+          "type": "number",
+          "description": "Cumulative VND deposited"
+        },
+        "totalDownloadedFiles": {
+          "type": "number",
+          "description": "Cumulative files downloaded"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["active", "banned"],
+          "description": "Account status"
+        },
+        "emailVerified": {
+          "type": "boolean",
+          "description": "Whether the user's email has been verified via Gmail OTP or Google OAuth"
+        },
+        "authProvider": {
+          "type": "string",
+          "enum": ["google", "password"],
+          "description": "Primary authentication provider"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Creation timestamp"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Last update timestamp"
+        }
+      },
+      "required": [
+        "uid",
+        "username",
+        "email",
+        "role",
+        "credits",
+        "balanceVnd",
+        "totalDepositedVnd",
+        "totalDownloadedFiles",
+        "status",
+        "emailVerified",
+        "authProvider",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "DownloadRecord": {
+      "title": "DownloadRecord",
+      "description": "Record of a file or folder download unlocked by a user.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Owner user UID",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "username": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "fileName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "driveUrl": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "fileType": {
+          "type": "string",
+          "enum": ["file", "folder"]
+        },
+        "fileCount": {
+          "type": "number"
+        },
+        "sizeFormatted": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "creditsUsed": {
+          "type": "number"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["processing", "completed", "error"]
+        },
+        "destinationFolderLink": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "userId",
+        "username",
+        "fileName",
+        "driveUrl",
+        "fileType",
+        "fileCount",
+        "sizeFormatted",
+        "creditsUsed",
+        "status",
+        "destinationFolderLink",
+        "createdAt"
+      ]
+    },
+    "AdminMarker": {
+      "title": "AdminMarker",
+      "description": "Trusted admin role marker document.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 120
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "email", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Stores individual user profiles, balances, and verification states."
+    },
+    "/downloads/{downloadId}": {
+      "schema": { "$ref": "#/entities/DownloadRecord" },
+      "description": "Stores download history items per user."
+    },
+    "/admins/{adminId}": {
+      "schema": { "$ref": "#/entities/AdminMarker" },
+      "description": "Stores trusted administrator UIDs."
+    }
+  }
+}
