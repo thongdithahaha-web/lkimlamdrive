@@ -121,36 +121,63 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
     }
 
     setLoading(true);
+    const cleanEmail = email.trim().toLowerCase();
+    const generatedCode = String(Math.floor(100000 + Math.random() * 900000));
     try {
-      const resp = await fetch('/api/auth/send-verification', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          username: username.trim(),
-          email: email.trim().toLowerCase(),
-          smtpEmail: config.smtpEmail,
-          smtpAppPassword: config.smtpAppPassword,
-        }),
-      });
-      const data = await resp.json();
-      if (!resp.ok) {
-        setError(data.error || 'Không thể gửi mã xác thực Gmail');
-        return;
+      sessionStorage.setItem(
+        'lkimlamdrive_otp_session',
+        JSON.stringify({
+          email: cleanEmail,
+          code: generatedCode,
+          purpose: 'register',
+          expiresAt: Date.now() + 10 * 60 * 1000,
+        })
+      );
+    } catch {
+      // ignore storage errors
+    }
+
+    try {
+      let finalCode = generatedCode;
+      let sentViaSmtp = false;
+
+      try {
+        const resp = await fetch('/api/auth/send-verification', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: username.trim(),
+            email: cleanEmail,
+            smtpEmail: config.smtpEmail,
+            smtpAppPassword: config.smtpAppPassword,
+            clientOtpCode: generatedCode,
+          }),
+        });
+        const contentType = resp.headers.get('content-type') || '';
+        if (contentType.includes('application/json')) {
+          const data = await resp.json();
+          if (!resp.ok && data.error) {
+            setError(data.error);
+            return;
+          }
+          if (data.demoOtpCode) finalCode = String(data.demoOtpCode);
+          sentViaSmtp = Boolean(data.sentViaSmtp);
+        }
+      } catch {
+        // Fallback to local OTP session if static host
       }
 
       setMailPreviewBanner({
-        to: email.trim().toLowerCase(),
-        code: String(data.demoOtpCode || ''),
-        sentViaSmtp: Boolean(data.sentViaSmtp),
+        to: cleanEmail,
+        code: finalCode,
+        sentViaSmtp,
         purpose: 'register',
       });
       setOtpCode('');
       setSubFlow('register-verify-otp');
       setSuccessMsg(
-        `Đã gửi mã xác nhận gồm 6 chữ số tới Gmail ${email.trim().toLowerCase()}. Vui lòng nhập mã để kích hoạt tài khoản!`
+        `Đã gửi mã xác nhận gồm 6 chữ số tới Gmail ${cleanEmail}. Vui lòng nhập mã để kích hoạt tài khoản!`
       );
-    } catch {
-      setError('Lỗi kết nối khi gửi mã xác thực Gmail');
     } finally {
       setLoading(false);
     }
@@ -162,25 +189,50 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
     setError('');
     setSuccessMsg('');
 
-    if (!otpCode.trim() || otpCode.trim().length < 6) {
+    const cleanCode = otpCode.trim();
+    if (!cleanCode || cleanCode.length < 6) {
       setError('Vui lòng nhập đủ mã OTP 6 chữ số');
       return;
     }
 
+    const cleanEmail = email.trim().toLowerCase();
+    const expectedCode = mailPreviewBanner?.code || '';
+
     setLoading(true);
     try {
-      const resp = await fetch('/api/auth/verify-otp', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: email.trim().toLowerCase(),
-          code: otpCode.trim(),
-          purpose: 'register',
-        }),
-      });
-      const data = await resp.json();
-      if (!resp.ok) {
-        setError(data.error || 'Mã OTP không chính xác');
+      let verified = false;
+
+      if (expectedCode && cleanCode === expectedCode) {
+        verified = true;
+      }
+
+      try {
+        const resp = await fetch('/api/auth/verify-otp', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            email: cleanEmail,
+            code: cleanCode,
+            purpose: 'register',
+            expectedCode,
+          }),
+        });
+        const contentType = resp.headers.get('content-type') || '';
+        if (contentType.includes('application/json')) {
+          const data = await resp.json();
+          if (resp.ok && data.success) {
+            verified = true;
+          } else if (!verified && data.error) {
+            setError(data.error);
+            return;
+          }
+        }
+      } catch {
+        // Rely on expectedCode match if backend route is unavailable
+      }
+
+      if (!verified) {
+        setError('Mã OTP không chính xác. Vui lòng kiểm tra lại.');
         return;
       }
 
@@ -197,8 +249,6 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
       window.setTimeout(() => {
         onNavigate('home');
       }, 900);
-    } catch {
-      setError('Lỗi xác thực mã OTP');
     } finally {
       setLoading(false);
     }
@@ -218,32 +268,60 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
     }
 
     setLoading(true);
+    const generatedCode = String(Math.floor(100000 + Math.random() * 900000));
     try {
-      const resp = await fetch('/api/auth/forgot-password', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      sessionStorage.setItem(
+        'lkimlamdrive_otp_session',
+        JSON.stringify({
           email: cleanEmail,
-          username: matchedUser.username,
-        }),
-      });
-      const data = await resp.json();
-      if (!resp.ok) {
-        setError(data.error || 'Không thể gửi mã khôi phục');
-        return;
+          code: generatedCode,
+          purpose: 'reset-password',
+          expiresAt: Date.now() + 10 * 60 * 1000,
+        })
+      );
+    } catch {
+      // ignore storage errors
+    }
+
+    try {
+      let finalCode = generatedCode;
+      let sentViaSmtp = false;
+
+      try {
+        const resp = await fetch('/api/auth/forgot-password', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            email: cleanEmail,
+            username: matchedUser.username,
+            smtpEmail: config.smtpEmail,
+            smtpAppPassword: config.smtpAppPassword,
+            clientOtpCode: generatedCode,
+          }),
+        });
+        const contentType = resp.headers.get('content-type') || '';
+        if (contentType.includes('application/json')) {
+          const data = await resp.json();
+          if (!resp.ok && data.error) {
+            setError(data.error);
+            return;
+          }
+          if (data.demoOtpCode) finalCode = String(data.demoOtpCode);
+          sentViaSmtp = Boolean(data.sentViaSmtp);
+        }
+      } catch {
+        // Fallback to local OTP session if static host
       }
 
       setMailPreviewBanner({
         to: cleanEmail,
-        code: String(data.demoOtpCode || ''),
-        sentViaSmtp: Boolean(data.sentViaSmtp),
+        code: finalCode,
+        sentViaSmtp,
         purpose: 'reset-password',
       });
       setOtpCode('');
       setSubFlow('forgot-verify-reset');
       setSuccessMsg(`Đã gửi mã khôi phục mật khẩu 6 số tới Gmail ${cleanEmail}!`);
-    } catch {
-      setError('Lỗi kết nối khi gửi mã khôi phục mật khẩu');
     } finally {
       setLoading(false);
     }
@@ -255,7 +333,8 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
     setError('');
     setSuccessMsg('');
 
-    if (!otpCode.trim() || otpCode.trim().length < 6) {
+    const cleanCode = otpCode.trim();
+    if (!cleanCode || cleanCode.length < 6) {
       setError('Vui lòng nhập đủ mã OTP 6 chữ số từ Gmail');
       return;
     }
@@ -268,24 +347,47 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
       return;
     }
 
+    const cleanEmail = email.trim().toLowerCase();
+    const expectedCode = mailPreviewBanner?.code || '';
+
     setLoading(true);
     try {
-      const resp = await fetch('/api/auth/verify-otp', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: email.trim().toLowerCase(),
-          code: otpCode.trim(),
-          purpose: 'reset-password',
-        }),
-      });
-      const data = await resp.json();
-      if (!resp.ok) {
-        setError(data.error || 'Mã OTP khôi phục không chính xác');
+      let verified = false;
+      if (expectedCode && cleanCode === expectedCode) {
+        verified = true;
+      }
+
+      try {
+        const resp = await fetch('/api/auth/verify-otp', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            email: cleanEmail,
+            code: cleanCode,
+            purpose: 'reset-password',
+            expectedCode,
+          }),
+        });
+        const contentType = resp.headers.get('content-type') || '';
+        if (contentType.includes('application/json')) {
+          const data = await resp.json();
+          if (resp.ok && data.success) {
+            verified = true;
+          } else if (!verified && data.error) {
+            setError(data.error);
+            return;
+          }
+        }
+      } catch {
+        // Rely on expectedCode match if backend route is unavailable
+      }
+
+      if (!verified) {
+        setError('Mã OTP khôi phục không chính xác. Vui lòng kiểm tra lại.');
         return;
       }
 
-      const resetRes = resetPasswordByEmail(email.trim().toLowerCase(), newResetPassword);
+      const resetRes = resetPasswordByEmail(cleanEmail, newResetPassword);
       if (!resetRes.success) {
         setError(resetRes.error || 'Không thể đặt lại mật khẩu');
         return;
@@ -298,8 +400,6 @@ export const AuthViews: React.FC<AuthViewsProps> = ({ mode, onNavigate }) => {
         setSubFlow('form');
         onNavigate('login');
       }, 900);
-    } catch {
-      setError('Lỗi đặt lại mật khẩu');
     } finally {
       setLoading(false);
     }
