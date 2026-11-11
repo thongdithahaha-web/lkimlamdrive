@@ -1,4 +1,4 @@
-import { DriveFileItem } from './systemRules';
+import type { DriveFileItem } from './systemRules.ts';
 
 export interface ScrapedDriveResult {
   folderTitle: string;

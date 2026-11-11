@@ -1,30 +1,40 @@
 import express from 'express';
 import crypto from 'crypto';
+import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import nodemailer from 'nodemailer';
-import firebaseConfig from './firebase-applet-config.json';
-import { parseDriveUrl, DriveFileItem } from './src/utils/systemRules';
+import { parseDriveUrl, type DriveFileItem } from './src/utils/systemRules.ts';
 import {
   fetchRealDriveFolder,
   fetchRealSingleDriveFile,
-} from './src/utils/driveScraper';
+} from './src/utils/driveScraper.ts';
 import {
   fetchGoogleSlidesAnimatedDeck,
   buildAnimatedPptxBuffer,
   buildPptxFromSlidePngs,
-} from './src/utils/pptxAnimator';
+} from './src/utils/pptxAnimator.ts';
 import {
-  DdosConfig,
+  type DdosConfig,
   DEFAULT_DDOS_CONFIG,
-  DdosSecurityEvent,
-  IpReputationRecord,
+  type DdosSecurityEvent,
+  type IpReputationRecord,
   inspectWafRequest,
   evaluateRateLimitDecision,
-} from './src/utils/ddosProtection';
+} from './src/utils/ddosProtection.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+let firebaseConfig: Record<string, any> = {};
+try {
+  const cfgPath = path.join(__dirname, 'firebase-applet-config.json');
+  if (fs.existsSync(cfgPath)) {
+    firebaseConfig = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
+  }
+} catch (e) {
+  console.warn('Could not read firebase-applet-config.json:', e);
+}
 
 const CHROME_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
@@ -477,7 +487,7 @@ async function getUnlockedViewerSession(fileId: string): Promise<ViewerSession |
 }
 
 export const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 // Layer 4: Payload Size Guard (64KB limit against memory exhaustion DDoS)
 app.use(express.json({ limit: '64kb' }));

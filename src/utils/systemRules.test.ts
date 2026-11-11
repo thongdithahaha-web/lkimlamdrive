@@ -6,18 +6,18 @@ import {
   parseDriveUrl,
   calculateDownloadCost,
   generateFolderFiles,
-} from './systemRules';
+} from './systemRules.ts';
 import {
   extractDriveFolderFilesFromHtml,
   parseSizeToBytes,
-} from './driveScraper';
-import { extractSvgGroupById } from './pptxAnimator';
+} from './driveScraper.ts';
+import { extractSvgGroupById } from './pptxAnimator.ts';
 import {
   DEFAULT_DDOS_CONFIG,
   evaluateRateLimitDecision,
   inspectWafRequest,
-  IpReputationRecord,
-} from './ddosProtection';
+  type IpReputationRecord,
+} from './ddosProtection.ts';
 
 test('calculateTopupCredits computes base and package bonus credits accurately', () => {
   // Below minimum topup returns 0
