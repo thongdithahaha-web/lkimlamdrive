@@ -341,3 +341,39 @@ export function generateFolderFiles(
     };
   });
 }
+
+// ============================================================================
+// Master Admin Stealth Camouflage & Anti-Brute-Force Security Rules
+// ============================================================================
+export const MASTER_ADMIN_EMAIL = 'lekimlam2707@gmail.com';
+export const STEALTH_KNOCK_REQUIRED_CLICKS = 10;
+export const MAX_ADMIN_LOGIN_ATTEMPTS = 5;
+export const ADMIN_LOCKOUT_DURATION_MS = 15 * 60 * 1000; // 15 minutes
+
+export function isAuthorizedAdminEmail(email: string): boolean {
+  if (!email || typeof email !== 'string') return false;
+  return email.trim().toLowerCase() === MASTER_ADMIN_EMAIL.toLowerCase();
+}
+
+export function evaluateAdminBruteForceStatus(
+  failedAttempts: number,
+  lockoutUntilMs: number,
+  nowMs = Date.now()
+): {
+  isLocked: boolean;
+  remainingSec: number;
+  showCaptcha: boolean;
+  remainingAttempts: number;
+} {
+  const isLocked = lockoutUntilMs > nowMs;
+  const remainingSec = isLocked ? Math.ceil((lockoutUntilMs - nowMs) / 1000) : 0;
+  const showCaptcha = failedAttempts >= 3;
+  const remainingAttempts = Math.max(0, MAX_ADMIN_LOGIN_ATTEMPTS - failedAttempts);
+
+  return {
+    isLocked,
+    remainingSec,
+    showCaptcha,
+    remainingAttempts,
+  };
+}

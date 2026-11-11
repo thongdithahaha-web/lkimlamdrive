@@ -11,6 +11,11 @@ import {
   AlertTriangle,
   ExternalLink,
   FileText,
+  Lock,
+  LogIn,
+  UserPlus,
+  Clipboard,
+  X,
 } from 'lucide-react';
 import { useAppStore } from '../context/AppContext';
 import { BrandLogo } from './BrandLogo';
@@ -57,6 +62,14 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
     files?: ProcessedDriveFile[];
   } | null>(null);
 
+  const requireAuth = (_reason?: string): boolean => {
+    if (!currentUser) {
+      onNavigate('register');
+      return false;
+    }
+    return true;
+  };
+
   const timerRef = useRef<number | null>(null);
 
   useEffect(() => {
@@ -94,6 +107,8 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
   }, [isFolder, showFolderList, folderFiles, selectedIds, config, currentUser]);
 
   const handleLoadFolderFiles = async () => {
+    if (!requireAuth('load')) return;
+
     if (!parsedUrl.isValid) {
       setJobState({
         status: 'error',
@@ -111,7 +126,8 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
       const result = await fetchDriveFilesReal(
         driveUrl,
         config.costPerSingleFileCredit,
-        config.costPerGbCredit
+        config.costPerGbCredit,
+        currentUser?.id
       );
       setFolderTitle(result.folderTitle);
       setFolderFiles(result.files);
@@ -132,6 +148,8 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
   };
 
   const handleStartDownload = async () => {
+    if (!requireAuth('download')) return;
+
     if (config.maintenanceMode && currentUser?.role !== 'admin') {
       setJobState({
         status: 'error',
@@ -187,10 +205,12 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
         selectedFileIds?: string[];
         costPerSingleFileCredit: number;
         costPerGbCredit: number;
+        userId?: string;
       } = {
         driveUrl,
         costPerSingleFileCredit: config.costPerSingleFileCredit,
         costPerGbCredit: config.costPerGbCredit,
+        userId: currentUser?.id,
       };
       if (isFolder && selectedIds.size > 0) {
         payload.selectedFileIds = Array.from(selectedIds);
@@ -198,7 +218,10 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
 
       const startRes = await fetch('/api/download/start', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(currentUser?.id ? { 'x-user-id': currentUser.id } : {}),
+        },
         body: JSON.stringify(payload),
       });
 
@@ -356,6 +379,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
   ) => {
     e.stopPropagation();
     e.preventDefault();
+    if (!requireAuth('download')) return;
     if (downloadingFileIds.has(fileId)) return;
 
     const cleanName =
@@ -515,28 +539,95 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
             {/* Drive Link Input & Primary Action */}
             <div className="w-full max-w-2xl mx-auto mb-12">
               <div className="flex flex-col sm:flex-row items-center gap-4">
-                <input
-                  type="text"
-                  aria-label="Đường dẫn Google Drive"
-                  value={driveUrl}
-                  onChange={(e) => {
-                    setDriveUrl(e.target.value);
-                    if (showFolderList) {
-                      setShowFolderList(false);
-                      setFolderFiles([]);
-                    }
-                    if (jobState) {
-                      setJobState(null);
-                    }
-                  }}
-                  placeholder={config.inputPlaceholder}
-                  className="w-full rounded-full border border-white/20 bg-white/5 px-6 py-4 text-white placeholder-white/50 backdrop-blur-xl focus:border-white/50 focus:outline-none focus:ring-2 focus:ring-white/20"
-                />
+                <div className="relative w-full">
+                  <input
+                    type="text"
+                    aria-label="Đường dẫn Google Drive"
+                    value={driveUrl}
+                    onChange={(e) => {
+                      if (!currentUser) {
+                        onNavigate('register');
+                        return;
+                      }
+                      setDriveUrl(e.target.value);
+                      if (showFolderList) {
+                        setShowFolderList(false);
+                        setFolderFiles([]);
+                      }
+                      if (jobState) {
+                        setJobState(null);
+                      }
+                    }}
+                    onClick={() => {
+                      if (!currentUser) onNavigate('register');
+                    }}
+                    onFocus={() => {
+                      if (!currentUser) onNavigate('register');
+                    }}
+                    onPaste={(e) => {
+                      if (!currentUser) {
+                        e.preventDefault();
+                        onNavigate('register');
+                      }
+                    }}
+                    onKeyDown={(e) => {
+                      if (!currentUser) {
+                        e.preventDefault();
+                        onNavigate('register');
+                      }
+                    }}
+                    placeholder={config.inputPlaceholder}
+                    className="w-full rounded-full border border-white/20 bg-white/5 pl-12 pr-24 py-4 text-white placeholder-white/50 backdrop-blur-xl focus:border-white/50 focus:outline-none focus:ring-2 focus:ring-white/20 transition-all"
+                  />
+                  <div className="absolute left-4 top-1/2 -translate-y-1/2 pointer-events-none flex items-center">
+                    <Link2 className="h-5 w-5 text-white/50" />
+                  </div>
+                  {/* Convenient Paste Action inside Input */}
+                  <div className="absolute right-3 top-1/2 -translate-y-1/2 flex items-center">
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        if (!currentUser) {
+                          onNavigate('register');
+                          return;
+                        }
+                        try {
+                          const text = await navigator.clipboard.readText();
+                          if (text) {
+                            setDriveUrl(text.trim());
+                            if (showFolderList) {
+                              setShowFolderList(false);
+                              setFolderFiles([]);
+                            }
+                            if (jobState) setJobState(null);
+                          }
+                        } catch {
+                          // ignore clipboard permission error
+                        }
+                      }}
+                      title="Dán từ Clipboard"
+                      className="px-3 py-1.5 rounded-full bg-white/10 hover:bg-white/20 text-white/80 hover:text-white text-xs font-medium flex items-center gap-1 transition-all cursor-pointer"
+                    >
+                      <Clipboard className="h-3.5 w-3.5" />
+                      <span className="hidden sm:inline">Dán</span>
+                    </button>
+                  </div>
+                </div>
+
                 <button
                   type="button"
-                  onClick={isFolder && !showFolderList ? handleLoadFolderFiles : handleStartDownload}
+                  onClick={() => {
+                    if (!requireAuth()) {
+                      return;
+                    }
+                    if (isFolder && !showFolderList) {
+                      handleLoadFolderFiles();
+                    } else {
+                      handleStartDownload();
+                    }
+                  }}
                   disabled={!driveUrl.trim() || downloading || loadingFiles}
-                  className="w-full sm:w-auto bg-white text-black rounded-full px-8 py-4 font-semibold shrink-0 shadow-2xl hover:bg-gray-200 disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center justify-center transition-all cursor-pointer"
+                  className="w-full sm:w-auto bg-white text-black hover:bg-gray-200 disabled:opacity-50 disabled:cursor-not-allowed rounded-full px-8 py-4 font-semibold shrink-0 shadow-2xl inline-flex items-center justify-center transition-all cursor-pointer"
                 >
                   {(downloading || loadingFiles) && (
                     <Loader2 className="animate-spin mr-2 h-5 w-5" />

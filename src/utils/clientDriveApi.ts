@@ -1,10 +1,10 @@
-import { DriveFileItem, parseDriveUrl } from './systemRules';
+import { type DriveFileItem, parseDriveUrl } from './systemRules.ts';
 import {
   extractDriveFolderFilesFromHtml,
   decodeHtmlEntities,
   formatBytesVi,
   computeFileCredits,
-} from './driveScraper';
+} from './driveScraper.ts';
 
 export interface ProcessedDriveFile extends DriveFileItem {
   proxyDownloadUrl: string;
@@ -22,17 +22,22 @@ export interface ListFilesApiResponse {
 export async function fetchDriveFilesReal(
   driveUrl: string,
   costPerSingleFileCredit = 1,
-  costPerGbCredit = 1
+  costPerGbCredit = 1,
+  userId?: string
 ): Promise<ListFilesApiResponse> {
   // 1. Primary path: call our Express backend /api/list-files
   try {
     const res = await fetch('/api/list-files', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(userId ? { 'x-user-id': userId } : {}),
+      },
       body: JSON.stringify({
         driveUrl,
         costPerSingleFileCredit,
         costPerGbCredit,
+        userId,
       }),
     });
 
@@ -526,71 +531,24 @@ function triggerBlobDownload(blob: Blob, filename: string) {
 }
 
 /**
- * Downloads a Google Drive presentation as a valid .PPTX file via Blob URL so the browser
- * never encounters "Không truy cập được trang", with an automatic client-side OpenXML .PPTX
- * builder fallback when running on static/serverless hosts where /api/ is unavailable.
+ * Downloads a Google Drive presentation/file as the 100% original binary file (.PPTX)
+ * directly streaming from Google Drive via backend proxy, preserving all media, animations,
+ * audio, and full original file size (35.5 MB, 89 MB, etc.).
  */
 export async function downloadDriveFileAsPptx(
   fileId: string,
   fileName: string
 ): Promise<void> {
   const cleanName = (fileName || `Presentation_${fileId}`).replace(/\.(pptx|ppt)?$/i, '') + '.pptx';
+  const downloadUrl = `/api/download/file/${encodeURIComponent(fileId)}?name=${encodeURIComponent(cleanName)}`;
 
-  // 1. Try backend /api/download/file/:fileId via fetch -> Blob -> URL.createObjectURL
-  try {
-    const controller = new AbortController();
-    const timer = window.setTimeout(() => controller.abort(), 28000);
-    try {
-      const res = await fetch(
-        `/api/download/file/${encodeURIComponent(fileId)}?name=${encodeURIComponent(cleanName)}`,
-        { signal: controller.signal }
-      );
-      const ct = res.headers.get('content-type') || '';
-      if (res.ok && !ct.includes('text/html')) {
-        const ab = await res.arrayBuffer();
-        if (ab.byteLength > 1000) {
-          const blob = new Blob([ab], {
-            type: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-          });
-          triggerBlobDownload(blob, cleanName);
-          return;
-        }
-      }
-    } finally {
-      window.clearTimeout(timer);
-    }
-  } catch {
-    // Proceed to client-side OpenXML PPTX builder fallback
-  }
-
-  // 2. Client-Side Fallback: Fetch presentation SVGs via CORS relay & build genuine OpenXML .PPTX in browser
-  const previewHtml = await fetchViaCorsRelay(
-    `https://docs.google.com/presentation/d/${encodeURIComponent(fileId)}/preview`
-  );
-  const svgMatches = [...previewHtml.matchAll(/SK_svgData\s*=\s*'([\s\S]*?)';/g)];
-  const decodedSvgs = svgMatches.map((m) =>
-    m[1]
-      .replace(/\\x([0-9a-fA-F]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
-      .replace(/\\\//g, '/')
-  );
-
-  const slidePngs: Uint8Array[] = [];
-  if (decodedSvgs.length > 0) {
-    const maxSlides = Math.min(decodedSvgs.length, 45);
-    for (let i = 0; i < maxSlides; i++) {
-      const pngBytes = await renderSvgStringToPngBytes(decodedSvgs[i], cleanName, i);
-      if (pngBytes.length > 0) {
-        slidePngs.push(pngBytes);
-      }
-    }
-  }
-
-  if (slidePngs.length === 0) {
-    const fallbackPng = await renderSvgStringToPngBytes('', cleanName, 0);
-    if (fallbackPng.length > 0) slidePngs.push(fallbackPng);
-  }
-
-  const pptxBlob = buildBrowserPptxFromPngs(slidePngs);
-  triggerBlobDownload(pptxBlob, cleanName);
+  const a = document.createElement('a');
+  a.href = downloadUrl;
+  a.download = cleanName;
+  a.target = '_blank';
+  a.rel = 'noreferrer';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
 }
 

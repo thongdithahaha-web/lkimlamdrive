@@ -1,4 +1,5 @@
 import express from 'express';
+import { Readable } from 'stream';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
@@ -1144,7 +1145,18 @@ app.use((req, res, next) => {
         driveUrl,
         costPerSingleFileCredit = 1,
         costPerGbCredit = 1,
+        userId,
       } = req.body || {};
+
+      const authUser = String(userId || req.headers['x-user-id'] || '').trim();
+      if (!authUser) {
+        res.status(401).json({
+          error:
+            'Ràng buộc bảo mật: Bạn cần đăng ký hoặc đăng nhập tài khoản trước khi dán link Google Drive và xem danh sách files.',
+          requireAuth: true,
+        });
+        return;
+      }
 
       const parsed = parseDriveUrl(String(driveUrl || ''));
       if (!parsed.isValid) {
@@ -1204,7 +1216,18 @@ app.use((req, res, next) => {
         selectedFileIds,
         costPerSingleFileCredit = 1,
         costPerGbCredit = 1,
+        userId,
       } = req.body || {};
+
+      const authUser = String(userId || req.headers['x-user-id'] || '').trim();
+      if (!authUser) {
+        res.status(401).json({
+          error:
+            'Ràng buộc bảo mật: Bạn cần đăng ký hoặc đăng nhập tài khoản trước khi thực hiện tải file.',
+          requireAuth: true,
+        });
+        return;
+      }
 
       const parsed = parseDriveUrl(String(driveUrl || ''));
       if (!parsed.isValid) {
@@ -1337,87 +1360,214 @@ app.use((req, res, next) => {
     });
   });
 
+  interface StreamOriginalResult {
+    success: boolean;
+    contentType?: string;
+    contentLength?: string;
+    fileName?: string;
+    stream?: NodeJS.ReadableStream;
+  }
+
+  async function fetchGoogleDriveOriginalStream(
+    fileId: string,
+    preferredFileName?: string
+  ): Promise<StreamOriginalResult> {
+    const cleanBaseName = (preferredFileName || `File_${fileId}`).trim();
+
+    const getCookies = (response: Response): string => {
+      if (typeof (response.headers as any).getSetCookie === 'function') {
+        const list = (response.headers as any).getSetCookie();
+        return list.map((c: string) => c.split(';')[0]).join('; ');
+      }
+      const raw = response.headers.get('set-cookie');
+      if (!raw) return '';
+      return raw.split(/,(?=[^;]+=[^;]+)/).map((c: string) => c.trim().split(';')[0]).join('; ');
+    };
+
+    // 1. Try Google Drive Usercontent Direct Download (Primary for all binary files: PPTX, PDF, ZIP, MP4, etc.)
+    const candidateUrls = [
+      `https://drive.usercontent.google.com/download?id=${encodeURIComponent(fileId)}&export=download&authuser=0`,
+      `https://drive.google.com/uc?export=download&id=${encodeURIComponent(fileId)}`,
+      `https://docs.google.com/uc?export=download&id=${encodeURIComponent(fileId)}`,
+    ];
+
+    for (const initialUrl of candidateUrls) {
+      try {
+        const initRes = await fetch(initialUrl, {
+          headers: {
+            'User-Agent': CHROME_UA,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept-Language': 'vi,en-US;q=0.9,en;q=0.8',
+          },
+          redirect: 'follow',
+        });
+
+        const initialCt = initRes.headers.get('content-type') || '';
+
+        // If it returned a binary file directly (not HTML virus warning page)
+        if (initRes.ok && !initialCt.includes('text/html') && initRes.body) {
+          let detectedName = cleanBaseName;
+          const cd = initRes.headers.get('content-disposition') || '';
+          const utf8Match = cd.match(/filename\*=UTF-8''([^;]+)/i);
+          const normalMatch = cd.match(/filename="?([^";]+)"?/i);
+          if (utf8Match && utf8Match[1]) {
+            try { detectedName = decodeURIComponent(utf8Match[1]); } catch { detectedName = utf8Match[1]; }
+          } else if (normalMatch && normalMatch[1]) {
+            detectedName = normalMatch[1];
+          }
+
+          return {
+            success: true,
+            contentType: initialCt,
+            contentLength: initRes.headers.get('content-length') || undefined,
+            fileName: detectedName,
+            stream: Readable.fromWeb(initRes.body as any),
+          };
+        }
+
+        // If it returned HTML, this is the Google Drive virus scan warning for large files (>25MB like 35.5 MB or 89 MB)
+        if (initRes.ok && initialCt.includes('text/html')) {
+          const html = await initRes.text();
+          const cookies = getCookies(initRes);
+
+          // Extract hidden inputs from download form
+          const formActionMatch = html.match(/<form[^>]+action=["']([^"']+)["'][^>]*>/i);
+          let actionUrl = formActionMatch ? formActionMatch[1] : 'https://drive.usercontent.google.com/download';
+          if (actionUrl.startsWith('/')) {
+            actionUrl = `https://drive.usercontent.google.com${actionUrl}`;
+          }
+
+          const queryParams = new URLSearchParams();
+          const inputRegex = /<input[^>]+name=["']([^"']+)["'][^>]*value=["']([^"']*)["'][^>]*>/gi;
+          let m;
+          while ((m = inputRegex.exec(html)) !== null) {
+            queryParams.set(m[1], m[2]);
+          }
+
+          const inputRegexRev = /<input[^>]+value=["']([^"']*)["'][^>]*name=["']([^"']+)["'][^>]*>/gi;
+          while ((m = inputRegexRev.exec(html)) !== null) {
+            if (!queryParams.has(m[2])) {
+              queryParams.set(m[2], m[1]);
+            }
+          }
+
+          if (!queryParams.has('id')) queryParams.set('id', fileId);
+          if (!queryParams.has('export')) queryParams.set('export', 'download');
+
+          const uuidMatch = html.match(/name=["']uuid["']\s+value=["']([^"']+)["']/i) ||
+                            html.match(/value=["']([^"']+)["']\s+name=["']uuid["']/i) ||
+                            html.match(/[?&]uuid=([a-zA-Z0-9_-]+)/);
+          if (uuidMatch && !queryParams.has('uuid')) queryParams.set('uuid', uuidMatch[1]);
+
+          const confirmMatch = html.match(/name=["']confirm["']\s+value=["']([^"']+)["']/i) ||
+                               html.match(/[?&]confirm=([a-zA-Z0-9_-]+)/i);
+          if (confirmMatch && !queryParams.has('confirm')) {
+            queryParams.set('confirm', confirmMatch[1]);
+          } else if (!queryParams.has('confirm')) {
+            queryParams.set('confirm', 't');
+          }
+
+          const ucLinkMatch = html.match(/id=["']uc-download-link["'][^>]+href=["']([^"']+)["']/i) ||
+                              html.match(/href=["']([^"']+)["'][^>]+id=["']uc-download-link["']/i);
+          let confirmDownloadUrl = `${actionUrl}?${queryParams.toString()}`;
+          if (ucLinkMatch && ucLinkMatch[1]) {
+            const rawLink = ucLinkMatch[1].replace(/&amp;/g, '&');
+            confirmDownloadUrl = rawLink.startsWith('http') ? rawLink : `https://drive.usercontent.google.com${rawLink}`;
+          }
+
+          // Execute second confirmed request with captured cookies and query parameters
+          const confirmedRes = await fetch(confirmDownloadUrl, {
+            headers: {
+              'User-Agent': CHROME_UA,
+              'Cookie': cookies,
+              'Referer': initialUrl,
+              'Accept': '*/*',
+            },
+            redirect: 'follow',
+          });
+
+          const confirmedCt = confirmedRes.headers.get('content-type') || '';
+          if (confirmedRes.ok && !confirmedCt.includes('text/html') && confirmedRes.body) {
+            let detectedName = cleanBaseName;
+            const cd = confirmedRes.headers.get('content-disposition') || '';
+            const utf8Match = cd.match(/filename\*=UTF-8''([^;]+)/i);
+            const normalMatch = cd.match(/filename="?([^";]+)"?/i);
+            if (utf8Match && utf8Match[1]) {
+              try { detectedName = decodeURIComponent(utf8Match[1]); } catch { detectedName = utf8Match[1]; }
+            } else if (normalMatch && normalMatch[1]) {
+              detectedName = normalMatch[1];
+            }
+
+            return {
+              success: true,
+              contentType: confirmedCt,
+              contentLength: confirmedRes.headers.get('content-length') || undefined,
+              fileName: detectedName,
+              stream: Readable.fromWeb(confirmedRes.body as any),
+            };
+          }
+        }
+      } catch (err) {
+        console.warn(`Error attempting drive download via ${initialUrl}:`, err);
+      }
+    }
+
+    // 2. Try Google Slides presentation export endpoint (for native Google Slides documents)
+    try {
+      const exportUrl = `https://docs.google.com/presentation/d/${encodeURIComponent(fileId)}/export/pptx`;
+      const exportRes = await fetch(exportUrl, {
+        headers: {
+          'User-Agent': CHROME_UA,
+          'Accept': '*/*',
+        },
+        redirect: 'follow',
+      });
+
+      const exportCt = exportRes.headers.get('content-type') || '';
+      if (exportRes.ok && !exportCt.includes('text/html') && exportRes.body) {
+        const cleanPptxName = cleanBaseName.replace(/\.(pptx|ppt)?$/i, '') + '.pptx';
+        return {
+          success: true,
+          contentType: exportCt || 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+          contentLength: exportRes.headers.get('content-length') || undefined,
+          fileName: cleanPptxName,
+          stream: Readable.fromWeb(exportRes.body as any),
+        };
+      }
+    } catch (exportErr) {
+      console.warn('Error attempting Google Slides export:', exportErr);
+    }
+
+    return { success: false };
+  }
+
   app.get('/api/download/file/:fileId', async (req, res) => {
     try {
       const { fileId } = req.params;
       const requestedName = String(req.query.name || `Drive_File_${fileId}.pptx`);
       const forceViewer = req.query.mode === 'viewer';
 
-      // 1. If not forcing viewer, always return a valid binary .PPTX or native file
+      // 1. If not forcing viewer, always deliver the 100% ORIGINAL Google Drive binary file
       if (!forceViewer) {
-        const cleanPptxName =
-          (requestedName || `Presentation_${fileId}`).replace(/\.(pptx|ppt)?$/i, '') + '.pptx';
-
-        // 1a. Check in-memory reconstructed PPTX cache first
-        const cachedPptx = pptxBufferCache.get(fileId);
-        if (cachedPptx && cachedPptx.expiresAt > Date.now()) {
+        const originalStream = await fetchGoogleDriveOriginalStream(fileId, requestedName);
+        if (originalStream.success && originalStream.stream) {
+          const finalName = originalStream.fileName || requestedName;
           res.setHeader(
             'Content-Type',
-            'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+            originalStream.contentType || 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
           );
           res.setHeader(
             'Content-Disposition',
-            `attachment; filename*=UTF-8''${encodeURIComponent(cachedPptx.filename)}`
+            `attachment; filename*=UTF-8''${encodeURIComponent(finalName)}`
           );
-          res.setHeader('Content-Length', String(cachedPptx.buffer.length));
-          res.send(cachedPptx.buffer);
+          if (originalStream.contentLength) {
+            res.setHeader('Content-Length', originalStream.contentLength);
+          }
+          originalStream.stream.pipe(res);
           return;
         }
 
-        // 1b. Try Google Slides direct export endpoint if allowed
-        try {
-          const exportUrl = `https://docs.google.com/presentation/d/${encodeURIComponent(fileId)}/export/pptx`;
-          const exportRes = await fetch(exportUrl, {
-            headers: { 'User-Agent': CHROME_UA },
-            redirect: 'manual',
-          });
-          if (exportRes.status >= 300 && exportRes.status < 400) {
-            const loc = exportRes.headers.get('location');
-            if (loc) {
-              res.redirect(302, loc);
-              return;
-            }
-          } else if (exportRes.ok) {
-            const exportCt = exportRes.headers.get('content-type') || '';
-            if (
-              !exportCt.includes('text/html') &&
-              (exportCt.includes('presentation') || exportCt.includes('octet-stream') || exportCt.includes('zip'))
-            ) {
-              res.redirect(302, exportUrl);
-              return;
-            }
-          }
-        } catch {
-          // Proceed to Drive usercontent download
-        }
-
-        // 1c. Try Google Drive direct download (including large-file virus scan confirmation bypass)
-        try {
-          const directUrl = `https://drive.usercontent.google.com/download?id=${encodeURIComponent(fileId)}&export=download&confirm=t`;
-          const directRes = await fetch(directUrl, {
-            headers: { 'User-Agent': CHROME_UA },
-            redirect: 'follow',
-          });
-          const contentType = directRes.headers.get('content-type') || '';
-
-          if (directRes.ok && contentType.includes('text/html')) {
-            const htmlText = await directRes.text();
-            const uuidMatch = htmlText.match(/name="uuid"\s+value="([^"]+)"/i);
-            if (uuidMatch && uuidMatch[1]) {
-              const confirmUrl = `https://drive.usercontent.google.com/download?id=${encodeURIComponent(fileId)}&export=download&confirm=t&uuid=${encodeURIComponent(uuidMatch[1])}`;
-              // Redirect directly so browser downloads full file from Google CDN without server payload limits
-              res.redirect(302, confirmUrl);
-              return;
-            }
-          } else if (directRes.ok && !contentType.includes('text/html')) {
-            res.redirect(302, directUrl);
-            return;
-          }
-        } catch {
-          // Proceed to OpenXML animated PPTX reconstruction
-        }
-
-        // 1d. Reconstruct full OpenXML .PPTX with all vector layers, images, slide transitions, and click-by-click animations
+        // Secondary fallback for presentations if direct download was restricted
         try {
           const deck = await fetchGoogleSlidesAnimatedDeck(fileId);
           if (deck && deck.slides.length > 0) {
@@ -1428,12 +1578,6 @@ app.use((req, res, next) => {
                   /\.(pptx|ppt)?$/i,
                   ''
                 ) + '.pptx';
-
-              pptxBufferCache.set(fileId, {
-                buffer: pptxBuf,
-                filename: cleanName,
-                expiresAt: Date.now() + 15 * 60 * 1000,
-              });
 
               res.setHeader(
                 'Content-Type',
@@ -1452,62 +1596,7 @@ app.use((req, res, next) => {
           console.warn('Animated deck build fallback:', deckErr);
         }
 
-        // 1e. Fallback: Build valid OpenXML .PPTX from unlocked viewer slide PNGs so download never fails
-        try {
-          const fallbackSession = await getUnlockedViewerSession(fileId);
-          if (fallbackSession && fallbackSession.pages > 0) {
-            const maxSlides = Math.min(fallbackSession.pages, 60);
-            const slideBuffers: Buffer[] = [];
-            const batchSize = 6;
-            for (let i = 0; i < maxSlides; i += batchSize) {
-              const batch = Array.from(
-                { length: Math.min(batchSize, maxSlides - i) },
-                (_, idx) => i + idx
-              );
-              const fetched = await Promise.all(
-                batch.map(async (pageIdx) => {
-                  try {
-                    const imgUrl = `https://drive.google.com/viewer/${fallbackSession.imgBasePath}&page=${pageIdx}&w=1280`;
-                    const r = await fetch(imgUrl, {
-                      headers: { 'User-Agent': CHROME_UA, Cookie: fallbackSession.cookies },
-                    });
-                    if (!r.ok) return null;
-                    return Buffer.from(await r.arrayBuffer());
-                  } catch {
-                    return null;
-                  }
-                })
-              );
-              for (const b of fetched) {
-                if (b && b.length > 100) slideBuffers.push(b);
-              }
-            }
-
-            if (slideBuffers.length > 0) {
-              const pptxBuf = buildPptxFromSlidePngs(slideBuffers);
-              pptxBufferCache.set(fileId, {
-                buffer: pptxBuf,
-                filename: cleanPptxName,
-                expiresAt: Date.now() + 15 * 60 * 1000,
-              });
-              res.setHeader(
-                'Content-Type',
-                'application/vnd.openxmlformats-officedocument.presentationml.presentation'
-              );
-              res.setHeader(
-                'Content-Disposition',
-                `attachment; filename*=UTF-8''${encodeURIComponent(cleanPptxName)}`
-              );
-              res.setHeader('Content-Length', String(pptxBuf.length));
-              res.send(pptxBuf);
-              return;
-            }
-          }
-        } catch (fallbackErr) {
-          console.warn('Fallback slide PNG PPTX error:', fallbackErr);
-        }
-
-        // If direct PPTX download was requested but not generated, redirect to Google Drive view
+        // Redirect to Google Drive preview if neither stream succeeded
         res.redirect(302, `https://drive.google.com/file/d/${encodeURIComponent(fileId)}/view`);
         return;
       }

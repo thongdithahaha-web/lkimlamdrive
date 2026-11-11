@@ -6,6 +6,9 @@ import {
   parseDriveUrl,
   calculateDownloadCost,
   generateFolderFiles,
+  isAuthorizedAdminEmail,
+  STEALTH_KNOCK_REQUIRED_CLICKS,
+  evaluateAdminBruteForceStatus,
 } from './systemRules.ts';
 import {
   extractDriveFolderFilesFromHtml,
@@ -126,6 +129,38 @@ test('evaluateRateLimitDecision and inspectWafRequest block DDoS floods, brute-f
 
   const wafBot = inspectWafRequest('/api/list-files', '', 'sqlmap/1.7');
   assert.equal(wafBot.blocked, true);
+});
+
+test('Master Admin security rules enforce sole authorized email and brute-force threshold', () => {
+  // Sole authorized email verification
+  assert.equal(isAuthorizedAdminEmail('lekimlam2707@gmail.com'), true);
+  assert.equal(isAuthorizedAdminEmail('  LEKIMLAM2707@GMAIL.COM  '), true);
+  assert.equal(isAuthorizedAdminEmail('hacker@gmail.com'), false);
+  assert.equal(isAuthorizedAdminEmail('admin@lkimlamdrive.vn'), false);
+  assert.equal(isAuthorizedAdminEmail(''), false);
+
+  // Stealth knock clicks threshold
+  assert.equal(STEALTH_KNOCK_REQUIRED_CLICKS, 10);
+
+  // Normal attempt
+  const t0 = Date.now();
+  const normal = evaluateAdminBruteForceStatus(1, 0, t0);
+  assert.equal(normal.isLocked, false);
+  assert.equal(normal.showCaptcha, false);
+  assert.equal(normal.remainingAttempts, 4);
+
+  // 3 failed attempts triggers CAPTCHA
+  const withCaptcha = evaluateAdminBruteForceStatus(3, 0, t0);
+  assert.equal(withCaptcha.showCaptcha, true);
+  assert.equal(withCaptcha.isLocked, false);
+  assert.equal(withCaptcha.remainingAttempts, 2);
+
+  // Lockout after 5 attempts
+  const lockUntil = t0 + 15 * 60 * 1000;
+  const locked = evaluateAdminBruteForceStatus(5, lockUntil, t0);
+  assert.equal(locked.isLocked, true);
+  assert.equal(locked.remainingSec, 900);
+  assert.equal(locked.remainingAttempts, 0);
 });
 
 

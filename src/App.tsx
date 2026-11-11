@@ -8,16 +8,15 @@ import { AppProvider } from './context/AppContext';
 import { HomeView, AppRoute } from './components/HomeView';
 import { AuthViews } from './components/AuthViews';
 import { UserDashboardView } from './components/UserDashboardView';
-import { AdminView } from './components/AdminView';
+import { AdminCamouflageGuard } from './components/AdminCamouflageGuard';
 
 function resolveRouteFromLocation(): AppRoute {
   const path = window.location.pathname.toLowerCase();
   const params = new URLSearchParams(window.location.search);
   const hash = window.location.hash.toLowerCase();
 
-  // Support /index.html, /admin, ?page=admin, #admin as direct Admin entry points
+  // Support /admin, ?page=admin, ?admin=1, #admin as Admin entry points
   if (
-    path.endsWith('/index.html') ||
     path === '/admin' ||
     path.startsWith('/admin/') ||
     params.get('page') === 'admin' ||
@@ -75,7 +74,7 @@ function RouterShell() {
     return <UserDashboardView key="history" defaultTab="history" onNavigate={navigate} />;
   }
   if (route === 'admin') {
-    return <AdminView onNavigate={navigate} />;
+    return <AdminCamouflageGuard onNavigate={navigate} />;
   }
   return <HomeView onNavigate={navigate} />;
 }
