@@ -11,11 +11,9 @@ import {
   AlertTriangle,
   ExternalLink,
   FileText,
-  Lock,
-  LogIn,
-  UserPlus,
   Clipboard,
-  X,
+  Share2,
+  Sparkles,
 } from 'lucide-react';
 import { useAppStore } from '../context/AppContext';
 import { BrandLogo } from './BrandLogo';
@@ -29,8 +27,15 @@ import {
   fetchDriveFilesReal,
   ProcessedDriveFile,
   downloadDriveFileAsPptx,
+  fetchDriveRelayStatus,
+  cloneAndShareDriveFile,
+  DriveRelayStatusResponse,
 } from '../utils/clientDriveApi';
 import { formatBytesVi } from '../utils/driveScraper';
+import {
+  connectGoogleDriveRelay,
+  getGoogleDriveAccessToken,
+} from '../firebase';
 
 export type AppRoute = 'home' | 'topup' | 'history' | 'login' | 'register' | 'admin';
 
@@ -50,6 +55,19 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
 
   const [downloading, setDownloading] = useState(false);
   const [downloadingFileIds, setDownloadingFileIds] = useState<Set<string>>(new Set());
+  const [cloningFileIds, setCloningFileIds] = useState<Set<string>>(new Set());
+  const [clonedLinksMap, setClonedLinksMap] = useState<
+    Record<string, { clonedFileId: string; webViewLink: string; directDownloadUrl: string }>
+  >({});
+  const [relayStatus, setRelayStatus] = useState<DriveRelayStatusResponse>({
+    connected: false,
+    relayEmail: null,
+    displayName: null,
+    connectedAt: null,
+    clonedCount: 0,
+  });
+  const [connectingRelay, setConnectingRelay] = useState(false);
+  const [relayNotice, setRelayNotice] = useState<string | null>(null);
   const [viewerModalFile, setViewerModalFile] = useState<{ id: string; name: string } | null>(null);
   const [jobState, setJobState] = useState<{
     status: 'processing' | 'completed' | 'error';
@@ -73,10 +91,104 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
   const timerRef = useRef<number | null>(null);
 
   useEffect(() => {
+    void fetchDriveRelayStatus().then((st) => setRelayStatus(st));
     return () => {
       if (timerRef.current) window.clearInterval(timerRef.current);
     };
   }, []);
+
+  const handleConnectRelayDrive = async (): Promise<boolean> => {
+    if (!requireAuth('relay')) return false;
+    setConnectingRelay(true);
+    setRelayNotice(null);
+    try {
+      const res = await connectGoogleDriveRelay();
+      if (res.connected) {
+        const st = await fetchDriveRelayStatus();
+        setRelayStatus({
+          ...st,
+          connected: true,
+          relayEmail: res.relayEmail || st.relayEmail || currentUser?.email || 'Drive Trung Gian',
+        });
+        setRelayNotice(
+          `Đã kết nối Tài Khoản Drive Trung Gian (${res.relayEmail || 'Google Drive'})! Mọi file tải xuống sẽ được tự động tạo bản sao & chia sẻ vượt mọi giới hạn.`
+        );
+        return true;
+      } else {
+        setRelayNotice(res.error || 'Chưa kết nối được Google Drive Trung Gian.');
+        return false;
+      }
+    } finally {
+      setConnectingRelay(false);
+    }
+  };
+
+  const handleCloneAndShareFile = async (
+    e: React.MouseEvent,
+    fileId: string,
+    fileName: string
+  ) => {
+    e.stopPropagation();
+    e.preventDefault();
+    if (!requireAuth('clone')) return;
+    if (cloningFileIds.has(fileId)) return;
+
+    // Ensure Relay Drive is connected first
+    if (!relayStatus.connected && !getGoogleDriveAccessToken()) {
+      const connectedOk = await handleConnectRelayDrive();
+      if (!connectedOk) return;
+    }
+
+    setCloningFileIds((prev) => {
+      const next = new Set(prev);
+      next.add(fileId);
+      return next;
+    });
+    setRelayNotice(null);
+
+    try {
+      let res = await cloneAndShareDriveFile(fileId, fileName, currentUser?.email);
+      if (!res.success && res.requireRelayConnect) {
+        const connectedOk = await handleConnectRelayDrive();
+        if (connectedOk) {
+          res = await cloneAndShareDriveFile(fileId, fileName, currentUser?.email);
+        }
+      }
+
+      if (res.success && res.clonedFileId && res.directDownloadUrl) {
+        const webViewLink =
+          res.webViewLink || `https://drive.google.com/file/d/${res.clonedFileId}/view?usp=sharing`;
+        setClonedLinksMap((prev) => ({
+          ...prev,
+          [fileId]: {
+            clonedFileId: res.clonedFileId!,
+            webViewLink,
+            directDownloadUrl: res.directDownloadUrl!,
+          },
+        }));
+        setRelayNotice(
+          `Đã tạo bản sao "${fileName}" trên Drive Trung Gian & chia sẻ tới ${currentUser?.email || 'bạn'}! Đang tải file gốc 100%...`
+        );
+
+        const a = document.createElement('a');
+        a.href = res.directDownloadUrl;
+        a.download = fileName;
+        a.target = '_blank';
+        a.rel = 'noreferrer';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+      } else {
+        setRelayNotice(res.error || 'Không thể tạo bản sao cho file này.');
+      }
+    } finally {
+      setCloningFileIds((prev) => {
+        const next = new Set(prev);
+        next.delete(fileId);
+        return next;
+      });
+    }
+  };
 
   const parsedUrl = useMemo(() => parseDriveUrl(driveUrl), [driveUrl]);
   const isFolder = parsedUrl.type === 'folder' || driveUrl.includes('/folders/');
@@ -220,11 +332,13 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
         payload.selectedFileIds = Array.from(selectedIds);
       }
 
+      const token = getGoogleDriveAccessToken();
       const startRes = await fetch('/api/download/start', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           ...(currentUser?.id ? { 'x-user-id': currentUser.id } : {}),
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
         },
         body: JSON.stringify(payload),
       });
@@ -388,7 +502,10 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
 
     const cleanName =
       (fileName || `Presentation_${fileId}`).replace(/\.(pptx|ppt)?$/i, '') + '.pptx';
-    const downloadUrl = `/api/download/file/${encodeURIComponent(fileId)}?name=${encodeURIComponent(cleanName)}`;
+    const token = getGoogleDriveAccessToken();
+    const downloadUrl = `/api/download/file/${encodeURIComponent(fileId)}?name=${encodeURIComponent(cleanName)}${
+      token ? `&access_token=${encodeURIComponent(token)}` : ''
+    }`;
 
     setDownloadingFileIds((prev) => {
       const next = new Set(prev);
@@ -643,6 +760,69 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
                 </button>
               </div>
 
+              {/* Drive Relay Account Bar (Only visible when logged in — keeps unauthenticated Home 100% clean) */}
+              {currentUser && (
+                <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-indigo-500/25 bg-indigo-950/20 px-4 py-3 text-left backdrop-blur-xl">
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <Sparkles className="h-4 w-4 text-indigo-400 shrink-0" />
+                    <div className="text-xs text-white/85">
+                      <span className="font-semibold text-indigo-300">
+                        Cơ Chế Tài Khoản Drive Trung Gian (Clone & Chia Sẻ):
+                      </span>{' '}
+                      {relayStatus.connected ? (
+                        <span className="text-emerald-300">
+                          Đang bật ({relayStatus.relayEmail}) — Tự động tạo bản sao & chia sẻ về{' '}
+                          <strong>{currentUser.email}</strong> để tải 100% file gốc vượt mọi giới hạn!
+                        </span>
+                      ) : (
+                        <span className="text-white/70">
+                          Kết nối 1 tài khoản Drive trung gian để tự động tạo bản sao (Clone), chia sẻ đến chính mình và tải 100% dung lượng gốc.
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={connectingRelay}
+                    onClick={handleConnectRelayDrive}
+                    className={`shrink-0 rounded-full px-3.5 py-1.5 text-xs font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer ${
+                      relayStatus.connected
+                        ? 'bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/30'
+                        : 'bg-indigo-500 hover:bg-indigo-400 text-white'
+                    }`}
+                  >
+                    {connectingRelay ? (
+                      <>
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        <span>Đang kết nối...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Share2 className="h-3.5 w-3.5" />
+                        <span>
+                          {relayStatus.connected
+                            ? 'Đổi Drive Trung Gian'
+                            : 'Kết Nối Drive Trung Gian'}
+                        </span>
+                      </>
+                    )}
+                  </button>
+                </div>
+              )}
+
+              {relayNotice && (
+                <div className="mt-3 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-2.5 text-left text-xs text-emerald-300 flex items-center justify-between gap-2">
+                  <span>{relayNotice}</span>
+                  <button
+                    type="button"
+                    onClick={() => setRelayNotice(null)}
+                    className="text-white/60 hover:text-white text-xs font-bold cursor-pointer"
+                  >
+                    ✕
+                  </button>
+                </div>
+              )}
+
               {/* Real Folder File Selector Card */}
               {showFolderList && (
                 <div className="mt-6 bg-white/5 border border-white/10 rounded-2xl p-4 backdrop-blur-xl text-left">
@@ -688,7 +868,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
                         <div
                           key={file.id}
                           onClick={() => toggleSelectFile(file.id)}
-                          className="flex items-center justify-between gap-3 p-2.5 hover:bg-white/5 rounded-lg border border-transparent hover:border-white/10 cursor-pointer transition-colors"
+                          className="flex flex-wrap sm:flex-nowrap items-center justify-between gap-3 p-2.5 hover:bg-white/5 rounded-lg border border-transparent hover:border-white/10 cursor-pointer transition-colors"
                         >
                           <div className="flex items-center gap-3 flex-1 min-w-0">
                             <input
@@ -705,26 +885,57 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
                             </div>
                           </div>
 
-                          <div className="flex items-center gap-1.5 shrink-0">
+                          <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                            <button
+                              type="button"
+                              disabled={cloningFileIds.has(file.id)}
+                              onClick={(e) => handleCloneAndShareFile(e, file.id, file.name)}
+                              className="text-xs bg-indigo-500/25 hover:bg-indigo-500/40 disabled:opacity-60 border border-indigo-400/40 text-indigo-200 px-2.5 py-1.5 rounded-lg font-medium shrink-0 inline-flex items-center gap-1 transition-colors cursor-pointer"
+                              title="Tạo bản sao qua Tài khoản Drive Trung Gian, chia sẻ đến chính mình & tải file gốc 100%"
+                            >
+                              {cloningFileIds.has(file.id) ? (
+                                <>
+                                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                  <span>Đang Clone...</span>
+                                </>
+                              ) : (
+                                <>
+                                  <Share2 className="h-3.5 w-3.5" />
+                                  <span>Clone & Tải Gốc</span>
+                                </>
+                              )}
+                            </button>
                             <button
                               type="button"
                               disabled={downloadingFileIds.has(file.id)}
                               onClick={(e) => handleDirectPptxDownload(e, file.id, file.name)}
                               className="text-xs bg-emerald-500/20 hover:bg-emerald-500/30 disabled:opacity-60 border border-emerald-500/30 text-emerald-300 px-3 py-1.5 rounded-lg font-medium shrink-0 inline-flex items-center gap-1.5 transition-colors cursor-pointer"
-                              title={`Tải file ${file.name} (.PPTX kèm đầy đủ hiệu ứng)`}
+                              title={`Tải file gốc ${file.name} (100% dung lượng gốc)`}
                             >
                               {downloadingFileIds.has(file.id) ? (
                                 <>
                                   <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                                  <span>Đang tải .PPTX...</span>
+                                  <span>Đang tải...</span>
                                 </>
                               ) : (
                                 <>
                                   <Download className="h-3.5 w-3.5" />
-                                  <span>Tải .PPTX (Đủ Hiệu Ứng)</span>
+                                  <span>Tải File Gốc</span>
                                 </>
                               )}
                             </button>
+                            {clonedLinksMap[file.id] && (
+                              <a
+                                href={clonedLinksMap[file.id].webViewLink}
+                                target="_blank"
+                                rel="noreferrer"
+                                onClick={(e) => e.stopPropagation()}
+                                className="text-xs bg-emerald-500/20 border border-emerald-400/40 text-emerald-300 px-2 py-1.5 rounded-lg inline-flex items-center gap-1"
+                                title="Mở bản sao đã chia sẻ cho bạn trên Google Drive"
+                              >
+                                <ExternalLink className="h-3.5 w-3.5" />
+                              </a>
+                            )}
                             <button
                               type="button"
                               onClick={(e) => {
@@ -816,7 +1027,26 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
                               <p className="text-xs text-white/50 tabular-nums">{f.sizeFormatted}</p>
                             </div>
                           </div>
-                          <div className="flex items-center gap-2 shrink-0">
+                          <div className="flex flex-wrap items-center gap-2 shrink-0">
+                            <button
+                              type="button"
+                              disabled={cloningFileIds.has(f.id)}
+                              onClick={(e) => handleCloneAndShareFile(e, f.id, f.name)}
+                              className="bg-indigo-500 hover:bg-indigo-400 disabled:opacity-60 text-white font-semibold px-3 py-1.5 rounded-lg text-xs inline-flex items-center gap-1.5 transition-colors cursor-pointer"
+                              title="Tạo bản sao qua Drive Trung Gian, chia sẻ cho chính mình & tải file gốc 100%"
+                            >
+                              {cloningFileIds.has(f.id) ? (
+                                <>
+                                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                  <span>Đang Clone...</span>
+                                </>
+                              ) : (
+                                <>
+                                  <Share2 className="h-3.5 w-3.5" />
+                                  <span>Clone & Chia Sẻ Về Drive</span>
+                                </>
+                              )}
+                            </button>
                             <button
                               type="button"
                               disabled={downloadingFileIds.has(f.id)}
@@ -826,12 +1056,12 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
                               {downloadingFileIds.has(f.id) ? (
                                 <>
                                   <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                                  <span>Đang tải .PPTX...</span>
+                                  <span>Đang tải...</span>
                                 </>
                               ) : (
                                 <>
                                   <Download className="h-3.5 w-3.5" />
-                                  <span>Tải .PPTX (Đầy Đủ Hiệu Ứng)</span>
+                                  <span>Tải File Gốc (100%)</span>
                                 </>
                               )}
                             </button>
@@ -844,7 +1074,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
                               <span>Trình Chiếu / PDF</span>
                             </button>
                             <a
-                              href={f.driveViewUrl}
+                              href={clonedLinksMap[f.id]?.webViewLink || f.driveViewUrl}
                               target="_blank"
                               rel="noreferrer"
                               className="bg-white/10 hover:bg-white/20 text-white px-2.5 py-1.5 rounded-lg text-xs inline-flex items-center gap-1 transition-colors"

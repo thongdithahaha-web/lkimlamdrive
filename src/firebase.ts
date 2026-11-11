@@ -25,11 +25,37 @@ import firebaseConfig from '../firebase-applet-config.json';
 import { UserAccount } from './utils/systemRules';
 
 const app = initializeApp(firebaseConfig);
-export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+const firestoreDbId =
+  (firebaseConfig as { firestoreDatabaseId?: string }).firestoreDatabaseId ||
+  'ai-studio-lkimlamdrivehthn-354e9e56-085d-409f-ac41-ea1e21a489e8';
+export const db = getFirestore(app, firestoreDbId);
 export const auth = getAuth(app);
+
+export const SCOPES = ['https://www.googleapis.com/auth/drive'];
 
 export const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({ prompt: 'select_account' });
+SCOPES.forEach((scope) => googleProvider.addScope(scope));
+
+// In-memory OAuth access token cache (never stored in localStorage/sessionStorage)
+let cachedAccessToken: string | null = null;
+let cachedRelayEmail: string | null = null;
+
+onAuthStateChanged(auth, (user) => {
+  if (!user) {
+    cachedAccessToken = null;
+    cachedRelayEmail = null;
+  }
+});
+
+export function getGoogleDriveAccessToken(): string | null {
+  return cachedAccessToken;
+}
+
+export function getConnectedRelayEmail(): string | null {
+  return cachedRelayEmail;
+}
+
 
 export enum OperationType {
   CREATE = 'create',
@@ -188,10 +214,77 @@ export async function syncGoogleUserWithFirestore(
   }
 }
 
+export async function registerRelayTokenWithServer(
+  accessToken: string,
+  email?: string | null
+): Promise<{ connected: boolean; relayEmail?: string; error?: string }> {
+  try {
+    const res = await fetch('/api/drive-relay/connect', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${accessToken}`,
+      },
+      body: JSON.stringify({ email: email || undefined }),
+    });
+    const data = await res.json();
+    if (res.ok && data.connected) {
+      cachedRelayEmail = data.relayEmail || email || null;
+      return { connected: true, relayEmail: cachedRelayEmail || undefined };
+    }
+    return { connected: false, error: data.error || 'Không thể kết nối Drive Trung Gian' };
+  } catch (err) {
+    return {
+      connected: false,
+      error: err instanceof Error ? err.message : 'Lỗi kết nối máy chủ Drive Trung Gian',
+    };
+  }
+}
+
+export async function connectGoogleDriveRelay(): Promise<{
+  connected: boolean;
+  accessToken?: string;
+  relayEmail?: string;
+  error?: string;
+}> {
+  try {
+    const relayProvider = new GoogleAuthProvider();
+    relayProvider.setCustomParameters({ prompt: 'consent select_account' });
+    SCOPES.forEach((scope) => relayProvider.addScope(scope));
+
+    const result = await signInWithPopup(auth, relayProvider);
+    const credential = GoogleAuthProvider.credentialFromResult(result);
+    const token = credential?.accessToken || null;
+    if (!token) {
+      return {
+        connected: false,
+        error: 'Không nhận được quyền truy cập Google Drive từ tài khoản này.',
+      };
+    }
+    cachedAccessToken = token;
+    cachedRelayEmail = result.user.email || null;
+    const serverReg = await registerRelayTokenWithServer(token, result.user.email);
+    return {
+      connected: true,
+      accessToken: token,
+      relayEmail: serverReg.relayEmail || result.user.email || 'Google Drive Relay',
+    };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { connected: false, error: msg };
+  }
+}
+
 export async function signInWithGooglePopup(
   defaultSignupCredits: number
 ): Promise<UserAccount> {
   const result = await signInWithPopup(auth, googleProvider);
+  const credential = GoogleAuthProvider.credentialFromResult(result);
+  if (credential?.accessToken) {
+    cachedAccessToken = credential.accessToken;
+    cachedRelayEmail = result.user.email || null;
+    void registerRelayTokenWithServer(credential.accessToken, result.user.email);
+  }
   return syncGoogleUserWithFirestore(result.user, defaultSignupCredits);
 }
 

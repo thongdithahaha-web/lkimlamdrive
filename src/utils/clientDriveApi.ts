@@ -5,11 +5,14 @@ import {
   formatBytesVi,
   computeFileCredits,
 } from './driveScraper.ts';
+import { getGoogleDriveAccessToken } from '../firebase.ts';
 
 export interface ProcessedDriveFile extends DriveFileItem {
   proxyDownloadUrl: string;
   viewerUnlockUrl?: string;
   driveViewUrl: string;
+  clonedFileId?: string;
+  clonedWebViewLink?: string;
 }
 
 export interface ListFilesApiResponse {
@@ -17,6 +20,74 @@ export interface ListFilesApiResponse {
   resourceId: string;
   folderTitle: string;
   files: DriveFileItem[];
+}
+
+export interface DriveRelayStatusResponse {
+  connected: boolean;
+  relayEmail: string | null;
+  displayName: string | null;
+  connectedAt: string | null;
+  clonedCount: number;
+}
+
+export async function fetchDriveRelayStatus(): Promise<DriveRelayStatusResponse> {
+  try {
+    const res = await fetch('/api/drive-relay/status');
+    if (res.ok) {
+      return (await res.json()) as DriveRelayStatusResponse;
+    }
+  } catch {
+    // ignore
+  }
+  return {
+    connected: false,
+    relayEmail: null,
+    displayName: null,
+    connectedAt: null,
+    clonedCount: 0,
+  };
+}
+
+export async function cloneAndShareDriveFile(
+  fileId: string,
+  fileName: string,
+  shareToEmail?: string
+): Promise<{
+  success: boolean;
+  clonedFileId?: string;
+  name?: string;
+  sizeBytes?: number;
+  webViewLink?: string;
+  directDownloadUrl?: string;
+  sharedWith?: string;
+  requireRelayConnect?: boolean;
+  error?: string;
+}> {
+  const token = getGoogleDriveAccessToken();
+  try {
+    const res = await fetch('/api/drive-relay/clone', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({ fileId, fileName, shareToEmail }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      return {
+        success: false,
+        requireRelayConnect: Boolean(data.requireRelayConnect),
+        error: data.error || 'Không thể tạo bản sao trên Drive Trung Gian',
+      };
+    }
+    return data;
+  } catch (err) {
+    return {
+      success: false,
+      error: err instanceof Error ? err.message : 'Lỗi kết nối máy chủ Drive Trung Gian',
+    };
+  }
 }
 
 export async function fetchDriveFilesReal(
@@ -27,12 +98,14 @@ export async function fetchDriveFilesReal(
 ): Promise<ListFilesApiResponse> {
   // 1. Primary path: call our Express backend /api/list-files
   let backendError: Error | null = null;
+  const token = getGoogleDriveAccessToken();
   try {
     const res = await fetch('/api/list-files', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         ...(userId ? { 'x-user-id': userId } : {}),
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
       body: JSON.stringify({
         driveUrl,

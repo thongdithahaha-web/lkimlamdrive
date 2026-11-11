@@ -1139,6 +1139,414 @@ app.use((req, res, next) => {
     res.json({ success: true, config: ddosConfig });
   });
 
+  // ============================================================================
+  // Google Drive Relay Account ("Tài Khoản Drive Trung Gian — Clone & Chia Sẻ")
+  // ============================================================================
+  interface DriveRelayState {
+    accessToken: string;
+    relayEmail: string;
+    displayName: string;
+    connectedAt: string;
+    clonedCount: number;
+  }
+
+  let activeDriveRelay: DriveRelayState | null = null;
+  const clonedFileCache = new Map<
+    string,
+    { clonedId: string; name: string; sizeBytes: number; webViewLink: string; createdAt: number }
+  >();
+
+  function getEffectiveRelayToken(req?: express.Request): string | null {
+    if (req) {
+      const authHeader = String(req.headers.authorization || '').trim();
+      if (authHeader.toLowerCase().startsWith('bearer ')) {
+        const token = authHeader.slice(7).trim();
+        if (token.length > 15) return token;
+      }
+      const queryToken = String(req.query?.access_token || '').trim();
+      if (queryToken.length > 15) return queryToken;
+    }
+    return activeDriveRelay?.accessToken || null;
+  }
+
+  async function verifyDriveTokenInfo(
+    token: string
+  ): Promise<{ valid: boolean; email?: string; displayName?: string }> {
+    try {
+      const aboutRes = await fetch(
+        'https://www.googleapis.com/drive/v3/about?fields=user(emailAddress,displayName)',
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+      if (!aboutRes.ok) return { valid: false };
+      const data = (await aboutRes.json()) as {
+        user?: { emailAddress?: string; displayName?: string };
+      };
+      return {
+        valid: true,
+        email: data.user?.emailAddress || 'drive-relay@gmail.com',
+        displayName: data.user?.displayName || 'Drive Trung Gian',
+      };
+    } catch {
+      return { valid: false };
+    }
+  }
+
+  async function listDriveFolderViaApiV3(
+    folderId: string,
+    costPerSingleFileCredit: number,
+    costPerGbCredit: number,
+    token?: string | null,
+    resourceKey?: string
+  ): Promise<{ folderTitle: string; files: DriveFileItem[] } | null> {
+    const apiKey = firebaseConfig.apiKey;
+    if (!token && !apiKey) return null;
+
+    const buildHeaders = (): Record<string, string> => {
+      const h: Record<string, string> = { 'User-Agent': CHROME_UA };
+      if (token) h.Authorization = `Bearer ${token}`;
+      if (resourceKey) {
+        h['X-Goog-Drive-Resource-Keys'] = `${folderId}/${resourceKey}`;
+      }
+      return h;
+    };
+
+    const buildUrl = (pathAndQuery: string): string => {
+      if (token) return `https://www.googleapis.com/drive/v3/${pathAndQuery}`;
+      const sep = pathAndQuery.includes('?') ? '&' : '?';
+      return `https://www.googleapis.com/drive/v3/${pathAndQuery}${sep}key=${encodeURIComponent(apiKey)}`;
+    };
+
+    try {
+      let folderTitle = `Thư mục Drive (${folderId.slice(0, 8)})`;
+      const metaRes = await fetch(
+        buildUrl(`files/${encodeURIComponent(folderId)}?supportsAllDrives=true&fields=id,name,mimeType`),
+        { headers: buildHeaders() }
+      );
+      if (metaRes.ok) {
+        const meta = (await metaRes.json()) as { name?: string };
+        if (meta.name) folderTitle = meta.name;
+      }
+
+      const fetchChildren = async (parentId: string, prefix = ''): Promise<{
+        files: DriveFileItem[];
+        subfolders: Array<{ id: string; name: string }>;
+      }> => {
+        const q = `'${parentId}' in parents and trashed = false`;
+        const listUrl = buildUrl(
+          `files?q=${encodeURIComponent(q)}&pageSize=200&supportsAllDrives=true&includeItemsFromAllDrives=true&fields=files(id,name,size,mimeType)&orderBy=name`
+        );
+        const res = await fetch(listUrl, { headers: buildHeaders() });
+        if (!res.ok) return { files: [], subfolders: [] };
+        const data = (await res.json()) as {
+          files?: Array<{ id: string; name: string; size?: string; mimeType?: string }>;
+        };
+        const items = data.files || [];
+        const outFiles: DriveFileItem[] = [];
+        const subfolders: Array<{ id: string; name: string }> = [];
+
+        for (const item of items) {
+          if (item.mimeType === 'application/vnd.google-apps.folder') {
+            subfolders.push({ id: item.id, name: item.name });
+          } else {
+            const sizeBytes = item.size ? parseInt(item.size, 10) || 0 : 0;
+            const gb = sizeBytes / (1024 * 1024 * 1024);
+            const sizeFormatted =
+              sizeBytes >= 1024 * 1024 * 1024
+                ? `${gb.toFixed(2)} GB`
+                : sizeBytes >= 1024 * 1024
+                ? `${(sizeBytes / (1024 * 1024)).toFixed(1)} MB`
+                : sizeBytes >= 1024
+                ? `${(sizeBytes / 1024).toFixed(0)} KB`
+                : sizeBytes > 0
+                ? `${sizeBytes} B`
+                : 'Tệp Google Drive';
+            const credits = Math.max(
+              costPerSingleFileCredit,
+              Math.ceil(gb * costPerGbCredit) || costPerSingleFileCredit
+            );
+            outFiles.push({
+              id: item.id,
+              name: prefix ? `[${prefix}] ${item.name}` : item.name,
+              sizeBytes,
+              sizeFormatted,
+              mimeType: item.mimeType || 'application/octet-stream',
+              credits,
+            });
+          }
+        }
+        return { files: outFiles, subfolders };
+      };
+
+      const rootResult = await fetchChildren(folderId);
+      const allFiles = [...rootResult.files];
+
+      // Crawl up to 10 subfolders if present (e.g. UNIT 1, UNIT 2, UNIT 3...)
+      if (rootResult.subfolders.length > 0) {
+        const subResults = await Promise.all(
+          rootResult.subfolders.slice(0, 10).map((sf) => fetchChildren(sf.id, sf.name))
+        );
+        for (const sr of subResults) {
+          allFiles.push(...sr.files);
+        }
+      }
+
+      if (allFiles.length === 0) return null;
+      return { folderTitle, files: allFiles };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Clones a restricted or quota-locked Google Drive file into the Relay Drive account
+   * and shares it with the user (and/or public reader) so it can be downloaded at 100% original size.
+   */
+  async function cloneAndShareViaRelayDrive(
+    fileId: string,
+    token: string,
+    preferredName?: string,
+    shareToEmail?: string
+  ): Promise<{
+    success: boolean;
+    clonedId?: string;
+    name?: string;
+    sizeBytes?: number;
+    mimeType?: string;
+    webViewLink?: string;
+    error?: string;
+  }> {
+    try {
+      const cached = clonedFileCache.get(fileId);
+      if (cached && Date.now() - cached.createdAt < 30 * 60 * 1000) {
+        if (shareToEmail && shareToEmail.includes('@')) {
+          await fetch(
+            `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(cached.clonedId)}/permissions?supportsAllDrives=true&sendNotificationEmail=false`,
+            {
+              method: 'POST',
+              headers: {
+                Authorization: `Bearer ${token}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                role: 'reader',
+                type: 'user',
+                emailAddress: shareToEmail.trim(),
+              }),
+            }
+          ).catch(() => {});
+        }
+        return {
+          success: true,
+          clonedId: cached.clonedId,
+          name: cached.name,
+          sizeBytes: cached.sizeBytes,
+          webViewLink: cached.webViewLink,
+        };
+      }
+
+      const copyBody: Record<string, string> = {};
+      if (preferredName && preferredName.trim()) {
+        copyBody.name = preferredName.trim();
+      }
+
+      const copyRes = await fetch(
+        `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}/copy?supportsAllDrives=true&fields=id,name,size,mimeType,webViewLink,webContentLink`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(copyBody),
+        }
+      );
+
+      if (!copyRes.ok) {
+        const errData = (await copyRes.json().catch(() => ({}))) as {
+          error?: { message?: string };
+        };
+        return {
+          success: false,
+          error: errData.error?.message || `HTTP ${copyRes.status} khi tạo bản sao trên Drive Trung Gian`,
+        };
+      }
+
+      const cloned = (await copyRes.json()) as {
+        id: string;
+        name?: string;
+        size?: string;
+        mimeType?: string;
+        webViewLink?: string;
+      };
+
+      // 1. Share publicly (anyone with link = reader) so browser & user can download without barrier
+      await fetch(
+        `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(cloned.id)}/permissions?supportsAllDrives=true`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            role: 'reader',
+            type: 'anyone',
+          }),
+        }
+      ).catch(() => {});
+
+      // 2. Also share directly to user's personal Gmail if provided ("chia sẻ đến chính mình")
+      if (shareToEmail && shareToEmail.includes('@')) {
+        await fetch(
+          `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(cloned.id)}/permissions?supportsAllDrives=true&sendNotificationEmail=false`,
+          {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${token}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              role: 'reader',
+              type: 'user',
+              emailAddress: shareToEmail.trim(),
+            }),
+          }
+        ).catch(() => {});
+      }
+
+      if (activeDriveRelay) {
+        activeDriveRelay.clonedCount += 1;
+      }
+
+      const sizeBytes = cloned.size ? parseInt(cloned.size, 10) || 0 : 0;
+      const webViewLink =
+        cloned.webViewLink || `https://drive.google.com/file/d/${cloned.id}/view?usp=sharing`;
+
+      clonedFileCache.set(fileId, {
+        clonedId: cloned.id,
+        name: cloned.name || preferredName || `Cloned_${fileId}`,
+        sizeBytes,
+        webViewLink,
+        createdAt: Date.now(),
+      });
+
+      return {
+        success: true,
+        clonedId: cloned.id,
+        name: cloned.name || preferredName,
+        sizeBytes,
+        mimeType: cloned.mimeType,
+        webViewLink,
+      };
+    } catch (err) {
+      return {
+        success: false,
+        error: err instanceof Error ? err.message : 'Lỗi tạo bản sao Drive Trung Gian',
+      };
+    }
+  }
+
+  app.get('/api/drive-relay/status', (_req, res) => {
+    res.json({
+      connected: Boolean(activeDriveRelay?.accessToken),
+      relayEmail: activeDriveRelay?.relayEmail || null,
+      displayName: activeDriveRelay?.displayName || null,
+      connectedAt: activeDriveRelay?.connectedAt || null,
+      clonedCount: activeDriveRelay?.clonedCount || 0,
+    });
+  });
+
+  app.post('/api/drive-relay/connect', async (req, res) => {
+    try {
+      const token = getEffectiveRelayToken(req);
+      if (!token) {
+        res.status(400).json({ connected: false, error: 'Thiếu Google Drive Access Token' });
+        return;
+      }
+
+      const info = await verifyDriveTokenInfo(token);
+      if (!info.valid) {
+        res.status(401).json({
+          connected: false,
+          error: 'Token Google Drive không hợp lệ hoặc đã hết hạn. Vui lòng kết nối lại.',
+        });
+        return;
+      }
+
+      activeDriveRelay = {
+        accessToken: token,
+        relayEmail: info.email || String(req.body?.email || 'drive-relay@gmail.com'),
+        displayName: info.displayName || 'Drive Trung Gian',
+        connectedAt: new Date().toISOString(),
+        clonedCount: activeDriveRelay?.clonedCount || 0,
+      };
+
+      res.json({
+        connected: true,
+        relayEmail: activeDriveRelay.relayEmail,
+        displayName: activeDriveRelay.displayName,
+        clonedCount: activeDriveRelay.clonedCount,
+      });
+    } catch (err) {
+      console.error('Error connecting drive relay:', err);
+      res.status(500).json({ connected: false, error: 'Không thể kết nối Drive Trung Gian' });
+    }
+  });
+
+  app.post('/api/drive-relay/clone', async (req, res) => {
+    try {
+      const { fileId, fileName, shareToEmail } = req.body || {};
+      const cleanFileId = String(fileId || '').trim();
+      if (!cleanFileId) {
+        res.status(400).json({ error: 'Thiếu fileId cần tạo bản sao' });
+        return;
+      }
+
+      const token = getEffectiveRelayToken(req);
+      if (!token) {
+        res.status(401).json({
+          error:
+            'Chưa kết nối Tài Khoản Drive Trung Gian. Hãy bấm nút "Kết Nối Drive Trung Gian" để kích hoạt cơ chế tạo bản sao & chia sẻ vượt mọi rào cản!',
+          requireRelayConnect: true,
+        });
+        return;
+      }
+
+      const cloneRes = await cloneAndShareViaRelayDrive(
+        cleanFileId,
+        token,
+        fileName ? String(fileName) : undefined,
+        shareToEmail ? String(shareToEmail) : undefined
+      );
+
+      if (!cloneRes.success || !cloneRes.clonedId) {
+        res.status(400).json({
+          error:
+            cloneRes.error ||
+            'Không thể tạo bản sao cho tệp này. Hãy đảm bảo tệp được chia sẻ công khai hoặc tài khoản Drive Trung Gian có quyền xem.',
+        });
+        return;
+      }
+
+      const finalName = cloneRes.name || String(fileName || `Drive_${cleanFileId}`);
+      res.json({
+        success: true,
+        originalFileId: cleanFileId,
+        clonedFileId: cloneRes.clonedId,
+        name: finalName,
+        sizeBytes: cloneRes.sizeBytes || 0,
+        webViewLink: cloneRes.webViewLink,
+        directDownloadUrl: `/api/download/file/${encodeURIComponent(cloneRes.clonedId)}?name=${encodeURIComponent(finalName)}&cloned=1`,
+        sharedWith: shareToEmail || activeDriveRelay?.relayEmail || 'public',
+      });
+    } catch (err) {
+      console.error('Error in /api/drive-relay/clone:', err);
+      res.status(500).json({ error: 'Lỗi khi tạo bản sao trên Drive Trung Gian' });
+    }
+  });
+
   app.post('/api/list-files', async (req, res) => {
     try {
       const {
@@ -1168,7 +1576,29 @@ app.use((req, res, next) => {
         return;
       }
 
+      const relayToken = getEffectiveRelayToken(req);
+
       if (parsed.type === 'folder') {
+        // 1. Try Drive API v3 (with Relay OAuth token or API Key) for 100% accurate folder & subfolder listing
+        const apiFolderData = await listDriveFolderViaApiV3(
+          parsed.resourceId,
+          Number(costPerSingleFileCredit) || 1,
+          Number(costPerGbCredit) || 1,
+          relayToken,
+          parsed.resourceKey
+        );
+
+        if (apiFolderData && apiFolderData.files.length > 0) {
+          res.json({
+            type: 'folder',
+            resourceId: parsed.resourceId,
+            folderTitle: apiFolderData.folderTitle,
+            files: apiFolderData.files,
+          });
+          return;
+        }
+
+        // 2. Fallback to HTML/JSON scraper
         const folderData = await fetchRealDriveFolder(
           parsed.resourceId,
           Number(costPerSingleFileCredit) || 1,
@@ -1179,7 +1609,7 @@ app.use((req, res, next) => {
         if (folderData.files.length === 0) {
           res.status(404).json({
             error:
-              'Không tìm thấy file công khai trong thư mục này. Hãy đảm bảo thư mục Google Drive được bật chia sẻ công khai.',
+              'Không tìm thấy file công khai trong thư mục này. Hãy đảm bảo thư mục Google Drive được bật chia sẻ công khai hoặc bấm "Kết Nối Drive Trung Gian" để quét bằng quyền tài khoản Drive.',
           });
           return;
         }
@@ -1191,6 +1621,60 @@ app.use((req, res, next) => {
           files: folderData.files,
         });
         return;
+      }
+
+      // Single file metadata: try Drive API v3 first for exact byte size
+      if (relayToken || firebaseConfig.apiKey) {
+        try {
+          const metaUrl = relayToken
+            ? `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(parsed.resourceId)}?supportsAllDrives=true&fields=id,name,size,mimeType`
+            : `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(parsed.resourceId)}?supportsAllDrives=true&fields=id,name,size,mimeType&key=${encodeURIComponent(firebaseConfig.apiKey)}`;
+          const metaRes = await fetch(metaUrl, {
+            headers: relayToken ? { Authorization: `Bearer ${relayToken}` } : {},
+          });
+          if (metaRes.ok) {
+            const meta = (await metaRes.json()) as {
+              id: string;
+              name?: string;
+              size?: string;
+              mimeType?: string;
+            };
+            if (meta && meta.name) {
+              const sizeBytes = meta.size ? parseInt(meta.size, 10) || 0 : 0;
+              const gb = sizeBytes / (1024 * 1024 * 1024);
+              const sizeFormatted =
+                sizeBytes >= 1024 * 1024 * 1024
+                  ? `${gb.toFixed(2)} GB`
+                  : sizeBytes >= 1024 * 1024
+                  ? `${(sizeBytes / (1024 * 1024)).toFixed(1)} MB`
+                  : sizeBytes >= 1024
+                  ? `${(sizeBytes / 1024).toFixed(0)} KB`
+                  : sizeBytes > 0
+                  ? `${sizeBytes} B`
+                  : 'Tệp Google Drive';
+              const singleCost = Number(costPerSingleFileCredit) || 1;
+              const gbCost = Number(costPerGbCredit) || 1;
+              const credits = Math.max(singleCost, Math.ceil(gb * gbCost) || singleCost);
+              const apiSingleFile: DriveFileItem = {
+                id: parsed.resourceId,
+                name: meta.name,
+                sizeBytes,
+                sizeFormatted,
+                mimeType: meta.mimeType || 'application/octet-stream',
+                credits,
+              };
+              res.json({
+                type: 'file',
+                resourceId: parsed.resourceId,
+                folderTitle: apiSingleFile.name,
+                files: [apiSingleFile],
+              });
+              return;
+            }
+          }
+        } catch {
+          // fallback to scraper below
+        }
       }
 
       const singleFile = await fetchRealSingleDriveFile(
@@ -1238,17 +1722,28 @@ app.use((req, res, next) => {
         return;
       }
 
+      const relayToken = getEffectiveRelayToken(req);
       const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
       let targetFiles: DriveFileItem[] = [];
       let folderTitle = '';
 
       if (parsed.type === 'folder') {
-        const folderData = await fetchRealDriveFolder(
+        const apiFolderData = await listDriveFolderViaApiV3(
           parsed.resourceId,
           Number(costPerSingleFileCredit) || 1,
           Number(costPerGbCredit) || 1,
+          relayToken,
           parsed.resourceKey
         );
+        const folderData =
+          apiFolderData && apiFolderData.files.length > 0
+            ? apiFolderData
+            : await fetchRealDriveFolder(
+                parsed.resourceId,
+                Number(costPerSingleFileCredit) || 1,
+                Number(costPerGbCredit) || 1,
+                parsed.resourceKey
+              );
         folderTitle = folderData.folderTitle;
         if (Array.isArray(selectedFileIds) && selectedFileIds.length > 0) {
           const idSet = new Set(selectedFileIds.map(String));
@@ -1300,7 +1795,7 @@ app.use((req, res, next) => {
         id: jobId,
         status: 'completed',
         progress: 100,
-        message: `Hoàn tất! Đã mở khóa ${total} file từ "${folderTitle}" (Hỗ trợ tải .PPTX đầy đủ hiệu ứng & PDF)`,
+        message: `Hoàn tất! Đã mở khóa ${total} file gốc từ "${folderTitle}" (Giữ nguyên 100% dung lượng gốc)`,
         current: total,
         total,
         driveLink: mainDriveLink,
@@ -1374,9 +1869,137 @@ app.use((req, res, next) => {
 
   async function fetchGoogleDriveOriginalStream(
     fileId: string,
-    preferredFileName?: string
+    preferredFileName?: string,
+    relayToken?: string | null
   ): Promise<StreamOriginalResult> {
     const cleanBaseName = (preferredFileName || `File_${fileId}`).trim();
+    const effectiveToken = relayToken || activeDriveRelay?.accessToken || null;
+
+    // =========================================================================
+    // LAYER 1: Drive Relay Account (Direct API v3 Stream + Clone-Copy Bypass)
+    // =========================================================================
+    if (effectiveToken) {
+      // 1A. Try direct binary download via Drive API v3 with Relay Token
+      try {
+        const directApiRes = await fetch(
+          `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media&supportsAllDrives=true&acknowledgeAbuse=true`,
+          {
+            headers: {
+              Authorization: `Bearer ${effectiveToken}`,
+              'User-Agent': CHROME_UA,
+            },
+            redirect: 'follow',
+          }
+        );
+        const ct = directApiRes.headers.get('content-type') || '';
+        if (directApiRes.ok && !ct.includes('text/html') && !ct.includes('application/json') && directApiRes.body) {
+          return {
+            success: true,
+            contentType: ct,
+            contentLength: directApiRes.headers.get('content-length') || undefined,
+            fileName: cleanBaseName,
+            stream: Readable.fromWeb(directApiRes.body as any),
+          };
+        }
+      } catch (err) {
+        console.warn('Relay direct API stream error:', err);
+      }
+
+      // 1B. Clone-Copy Bypass ("Tài khoản Drive khác tạo bản sao & chia sẻ đến chính mình"):
+      // Bypasses 24h download quota and owner viewer restrictions by creating a fresh copy owned by the Relay account!
+      try {
+        const cloneResult = await cloneAndShareViaRelayDrive(fileId, effectiveToken, cleanBaseName);
+        if (cloneResult.success && cloneResult.clonedId) {
+          const clonedMediaRes = await fetch(
+            `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(cloneResult.clonedId)}?alt=media&supportsAllDrives=true&acknowledgeAbuse=true`,
+            {
+              headers: {
+                Authorization: `Bearer ${effectiveToken}`,
+                'User-Agent': CHROME_UA,
+              },
+              redirect: 'follow',
+            }
+          );
+          const clonedCt = clonedMediaRes.headers.get('content-type') || '';
+          if (
+            clonedMediaRes.ok &&
+            !clonedCt.includes('text/html') &&
+            !clonedCt.includes('application/json') &&
+            clonedMediaRes.body
+          ) {
+            return {
+              success: true,
+              contentType: clonedCt,
+              contentLength:
+                clonedMediaRes.headers.get('content-length') ||
+                (cloneResult.sizeBytes ? String(cloneResult.sizeBytes) : undefined),
+              fileName: cloneResult.name || cleanBaseName,
+              stream: Readable.fromWeb(clonedMediaRes.body as any),
+            };
+          }
+
+          // If cloned file is a native Google Slides/Docs presentation, export its full PPTX from the clone
+          const clonedExportRes = await fetch(
+            `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(cloneResult.clonedId)}/export?mimeType=${encodeURIComponent('application/vnd.openxmlformats-officedocument.presentationml.presentation')}`,
+            {
+              headers: {
+                Authorization: `Bearer ${effectiveToken}`,
+                'User-Agent': CHROME_UA,
+              },
+              redirect: 'follow',
+            }
+          );
+          const clonedExportCt = clonedExportRes.headers.get('content-type') || '';
+          if (
+            clonedExportRes.ok &&
+            !clonedExportCt.includes('text/html') &&
+            !clonedExportCt.includes('application/json') &&
+            clonedExportRes.body
+          ) {
+            return {
+              success: true,
+              contentType: clonedExportCt,
+              contentLength: clonedExportRes.headers.get('content-length') || undefined,
+              fileName: cleanBaseName,
+              stream: Readable.fromWeb(clonedExportRes.body as any),
+            };
+          }
+        }
+      } catch (err) {
+        console.warn('Relay clone-and-stream fallback error:', err);
+      }
+    }
+
+    // =========================================================================
+    // LAYER 2: Google Drive API v3 Public Media Stream (with Project API Key)
+    // Bypasses HTML virus-scan warning pages for large files (35.5 MB, 89 MB, etc.)
+    // =========================================================================
+    if (firebaseConfig.apiKey) {
+      try {
+        const apiKeyUrl = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media&supportsAllDrives=true&acknowledgeAbuse=true&key=${encodeURIComponent(firebaseConfig.apiKey)}`;
+        const apiKeyRes = await fetch(apiKeyUrl, {
+          headers: { 'User-Agent': CHROME_UA },
+          redirect: 'follow',
+        });
+        const apiKeyCt = apiKeyRes.headers.get('content-type') || '';
+        if (
+          apiKeyRes.ok &&
+          !apiKeyCt.includes('text/html') &&
+          !apiKeyCt.includes('application/json') &&
+          apiKeyRes.body
+        ) {
+          return {
+            success: true,
+            contentType: apiKeyCt,
+            contentLength: apiKeyRes.headers.get('content-length') || undefined,
+            fileName: cleanBaseName,
+            stream: Readable.fromWeb(apiKeyRes.body as any),
+          };
+        }
+      } catch {
+        // continue to Layer 3
+      }
+    }
 
     const getCookies = (response: Response): string => {
       if (typeof (response.headers as any).getSetCookie === 'function') {
@@ -1388,11 +2011,14 @@ app.use((req, res, next) => {
       return raw.split(/,(?=[^;]+=[^;]+)/).map((c: string) => c.trim().split(';')[0]).join('; ');
     };
 
-    // 1. Try Google Drive Usercontent Direct Download (Primary for all binary files: PPTX, PDF, ZIP, MP4, etc.)
+    // =========================================================================
+    // LAYER 3: Google Drive Usercontent Direct Download (with confirm=t & UUID extraction)
+    // =========================================================================
     const candidateUrls = [
+      `https://drive.usercontent.google.com/download?id=${encodeURIComponent(fileId)}&export=download&confirm=t&authuser=0`,
       `https://drive.usercontent.google.com/download?id=${encodeURIComponent(fileId)}&export=download&authuser=0`,
-      `https://drive.google.com/uc?export=download&id=${encodeURIComponent(fileId)}`,
-      `https://docs.google.com/uc?export=download&id=${encodeURIComponent(fileId)}`,
+      `https://drive.google.com/uc?export=download&confirm=t&id=${encodeURIComponent(fileId)}`,
+      `https://docs.google.com/uc?export=download&confirm=t&id=${encodeURIComponent(fileId)}`,
     ];
 
     for (const initialUrl of candidateUrls) {
@@ -1463,6 +2089,10 @@ app.use((req, res, next) => {
                             html.match(/[?&]uuid=([a-zA-Z0-9_-]+)/);
           if (uuidMatch && !queryParams.has('uuid')) queryParams.set('uuid', uuidMatch[1]);
 
+          const atMatch = html.match(/name=["']at["']\s+value=["']([^"']+)["']/i) ||
+                          html.match(/value=["']([^"']+)["']\s+name=["']at["']/i);
+          if (atMatch && !queryParams.has('at')) queryParams.set('at', atMatch[1]);
+
           const confirmMatch = html.match(/name=["']confirm["']\s+value=["']([^"']+)["']/i) ||
                                html.match(/[?&]confirm=([a-zA-Z0-9_-]+)/i);
           if (confirmMatch && !queryParams.has('confirm')) {
@@ -1516,13 +2146,16 @@ app.use((req, res, next) => {
       }
     }
 
-    // 2. Try Google Slides presentation export endpoint (for native Google Slides documents)
+    // =========================================================================
+    // LAYER 4: Google Slides / Docs Native Export Endpoint (Full Original Export)
+    // =========================================================================
     try {
       const exportUrl = `https://docs.google.com/presentation/d/${encodeURIComponent(fileId)}/export/pptx`;
       const exportRes = await fetch(exportUrl, {
         headers: {
           'User-Agent': CHROME_UA,
           'Accept': '*/*',
+          ...(effectiveToken ? { Authorization: `Bearer ${effectiveToken}` } : {}),
         },
         redirect: 'follow',
       });
@@ -1550,10 +2183,17 @@ app.use((req, res, next) => {
       const { fileId } = req.params;
       const requestedName = String(req.query.name || `Drive_File_${fileId}.pptx`);
       const forceViewer = req.query.mode === 'viewer';
+      const allowReconstruct = req.query.mode === 'reconstruct';
+      const relayToken = getEffectiveRelayToken(req);
 
-      // 1. If not forcing viewer, always deliver the 100% ORIGINAL Google Drive binary file
+      // 1. If not forcing viewer, ALWAYS deliver the 100% ORIGINAL Google Drive binary file
+      // (Never shrink a 35.5 MB or 89 MB file down to a 1.18 MB reconstructed deck!)
       if (!forceViewer) {
-        const originalStream = await fetchGoogleDriveOriginalStream(fileId, requestedName);
+        const originalStream = await fetchGoogleDriveOriginalStream(
+          fileId,
+          requestedName,
+          relayToken
+        );
         if (originalStream.success && originalStream.stream) {
           const finalName = originalStream.fileName || requestedName;
           res.setHeader(
@@ -1585,37 +2225,42 @@ app.use((req, res, next) => {
           return;
         }
 
-        // Secondary fallback for presentations if direct download was restricted
-        try {
-          const deck = await fetchGoogleSlidesAnimatedDeck(fileId);
-          if (deck && deck.slides.length > 0) {
-            const pptxBuf = await buildAnimatedPptxBuffer(deck);
-            if (pptxBuf.length > 25000) {
-              const cleanName =
-                (requestedName || deck.title || `Presentation_${fileId}`).replace(
-                  /\.(pptx|ppt)?$/i,
-                  ''
-                ) + '.pptx';
+        // Only use reconstructed slide builder if explicitly requested via ?mode=reconstruct
+        if (allowReconstruct) {
+          try {
+            const deck = await fetchGoogleSlidesAnimatedDeck(fileId);
+            if (deck && deck.slides.length > 0) {
+              const pptxBuf = await buildAnimatedPptxBuffer(deck);
+              if (pptxBuf.length > 25000) {
+                const cleanName =
+                  (requestedName || deck.title || `Presentation_${fileId}`).replace(
+                    /\.(pptx|ppt)?$/i,
+                    ''
+                  ) + '.pptx';
 
-              res.setHeader(
-                'Content-Type',
-                'application/vnd.openxmlformats-officedocument.presentationml.presentation'
-              );
-              res.setHeader(
-                'Content-Disposition',
-                `attachment; filename*=UTF-8''${encodeURIComponent(cleanName)}`
-              );
-              res.setHeader('Content-Length', String(pptxBuf.length));
-              res.send(pptxBuf);
-              return;
+                res.setHeader(
+                  'Content-Type',
+                  'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+                );
+                res.setHeader(
+                  'Content-Disposition',
+                  `attachment; filename*=UTF-8''${encodeURIComponent(cleanName)}`
+                );
+                res.setHeader('Content-Length', String(pptxBuf.length));
+                res.send(pptxBuf);
+                return;
+              }
             }
+          } catch (deckErr) {
+            console.warn('Animated deck build fallback:', deckErr);
           }
-        } catch (deckErr) {
-          console.warn('Animated deck build fallback:', deckErr);
         }
 
-        // Redirect to Google Drive preview if neither stream succeeded
-        res.redirect(302, `https://drive.google.com/file/d/${encodeURIComponent(fileId)}/view`);
+        // Redirect directly to Google Drive's confirmed binary download URL so browser uses user's active Google session
+        res.redirect(
+          302,
+          `https://drive.usercontent.google.com/download?id=${encodeURIComponent(fileId)}&export=download&confirm=t`
+        );
         return;
       }
 
