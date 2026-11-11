@@ -245,6 +245,7 @@ export async function connectGoogleDriveRelay(): Promise<{
   connected: boolean;
   accessToken?: string;
   relayEmail?: string;
+  cancelled?: boolean;
   error?: string;
 }> {
   try {
@@ -269,8 +270,15 @@ export async function connectGoogleDriveRelay(): Promise<{
       accessToken: token,
       relayEmail: serverReg.relayEmail || result.user.email || 'Google Drive Relay',
     };
-  } catch (err) {
+  } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes('auth/popup-closed-by-user') || msg.includes('auth/cancelled-popup-request')) {
+      return {
+        connected: false,
+        cancelled: true,
+        error: 'Cửa sổ xác thực Google bị đóng hoặc bị trình duyệt chặn pop-up. Bạn có thể mở lại khi sẵn sàng.',
+      };
+    }
     return { connected: false, error: msg };
   }
 }

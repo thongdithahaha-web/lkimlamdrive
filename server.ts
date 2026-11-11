@@ -2225,41 +2225,67 @@ app.use((req, res, next) => {
           return;
         }
 
-        // Only use reconstructed slide builder if explicitly requested via ?mode=reconstruct
-        if (allowReconstruct) {
-          try {
-            const deck = await fetchGoogleSlidesAnimatedDeck(fileId);
-            if (deck && deck.slides.length > 0) {
-              const pptxBuf = await buildAnimatedPptxBuffer(deck);
-              if (pptxBuf.length > 25000) {
-                const cleanName =
-                  (requestedName || deck.title || `Presentation_${fileId}`).replace(
-                    /\.(pptx|ppt)?$/i,
-                    ''
-                  ) + '.pptx';
+        // Fallback for presentation files if direct binary download is blocked by owner restrictions:
+        try {
+          const deck = await fetchGoogleSlidesAnimatedDeck(fileId);
+          if (deck && deck.slides.length > 0) {
+            const pptxBuf = await buildAnimatedPptxBuffer(deck);
+            if (pptxBuf.length > 1000) {
+              const cleanName =
+                (requestedName || deck.title || `Presentation_${fileId}`).replace(
+                  /\.(pptx|ppt)?$/i,
+                  ''
+                ) + '.pptx';
 
-                res.setHeader(
-                  'Content-Type',
-                  'application/vnd.openxmlformats-officedocument.presentationml.presentation'
-                );
-                res.setHeader(
-                  'Content-Disposition',
-                  `attachment; filename*=UTF-8''${encodeURIComponent(cleanName)}`
-                );
-                res.setHeader('Content-Length', String(pptxBuf.length));
-                res.send(pptxBuf);
-                return;
-              }
+              res.setHeader(
+                'Content-Type',
+                'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+              );
+              res.setHeader(
+                'Content-Disposition',
+                `attachment; filename*=UTF-8''${encodeURIComponent(cleanName)}`
+              );
+              res.setHeader('Content-Length', String(pptxBuf.length));
+              res.send(pptxBuf);
+              return;
             }
-          } catch (deckErr) {
-            console.warn('Animated deck build fallback:', deckErr);
           }
+        } catch (deckErr) {
+          console.warn('Animated deck build fallback:', deckErr);
         }
 
-        // Redirect directly to Google Drive's confirmed binary download URL so browser uses user's active Google session
+        // Try Google Slides export endpoint directly
+        try {
+          const exportRes = await fetch(
+            `https://docs.google.com/presentation/d/${encodeURIComponent(fileId)}/export/pptx`,
+            {
+              headers: { 'User-Agent': CHROME_UA },
+              redirect: 'follow',
+            }
+          );
+          const ct = exportRes.headers.get('content-type') || '';
+          if (exportRes.ok && !ct.includes('text/html') && exportRes.body) {
+            const cleanName =
+              (requestedName || `Presentation_${fileId}`).replace(/\.(pptx|ppt)?$/i, '') + '.pptx';
+            res.setHeader(
+              'Content-Type',
+              'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+            );
+            res.setHeader(
+              'Content-Disposition',
+              `attachment; filename*=UTF-8''${encodeURIComponent(cleanName)}`
+            );
+            Readable.fromWeb(exportRes.body as any).pipe(res);
+            return;
+          }
+        } catch {
+          // ignore
+        }
+
+        // Redirect directly to Google Drive preview or confirmed download URL
         res.redirect(
           302,
-          `https://drive.usercontent.google.com/download?id=${encodeURIComponent(fileId)}&export=download&confirm=t`
+          `https://drive.google.com/file/d/${encodeURIComponent(fileId)}/view`
         );
         return;
       }
