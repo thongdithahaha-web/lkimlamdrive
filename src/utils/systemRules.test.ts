@@ -47,10 +47,15 @@ test('parseDriveUrl distinguishes Google Drive file and folder URLs', () => {
   assert.equal(fileRes.type, 'file');
   assert.equal(fileRes.resourceId, '1AbCdEfGhIjKlMnOpQrStUvWxYz');
 
-  const folderRes = parseDriveUrl('https://drive.google.com/drive/folders/1FolderXyZ987654321?usp=drive_link');
+  const folderRes = parseDriveUrl('https://drive.google.com/drive/folders/1FolderXyZ987654321?usp=drive_link&resourcekey=0-abc123');
   assert.equal(folderRes.isValid, true);
   assert.equal(folderRes.type, 'folder');
   assert.equal(folderRes.resourceId, '1FolderXyZ987654321');
+  assert.equal(folderRes.resourceKey, '0-abc123');
+
+  const incompleteFolderRes = parseDriveUrl('https://drive.google.com/drive/folders');
+  assert.equal(incompleteFolderRes.isValid, false);
+  assert.equal(incompleteFolderRes.type, 'folder');
 
   const invalidRes = parseDriveUrl('https://example.com/not-a-drive-link');
   assert.equal(invalidRes.isValid, false);

@@ -1161,7 +1161,9 @@ app.use((req, res, next) => {
       const parsed = parseDriveUrl(String(driveUrl || ''));
       if (!parsed.isValid) {
         res.status(400).json({
-          error: 'Link Google Drive không hợp lệ. Vui lòng dán đúng link File hoặc Thư mục Google Drive.',
+          error: String(driveUrl || '').includes('/folders')
+            ? 'Đường dẫn thư mục Google Drive đang bị thiếu mã ID ở cuối (Ví dụ đúng: https://drive.google.com/drive/folders/1AbCdEf...). Hãy chuột phải vào thư mục -> Chia sẻ -> Sao chép đường liên kết!'
+            : 'Link Google Drive không hợp lệ. Vui lòng dán đúng link File hoặc Thư mục Google Drive.',
         });
         return;
       }
@@ -1170,7 +1172,8 @@ app.use((req, res, next) => {
         const folderData = await fetchRealDriveFolder(
           parsed.resourceId,
           Number(costPerSingleFileCredit) || 1,
-          Number(costPerGbCredit) || 1
+          Number(costPerGbCredit) || 1,
+          parsed.resourceKey
         );
 
         if (folderData.files.length === 0) {
@@ -1243,7 +1246,8 @@ app.use((req, res, next) => {
         const folderData = await fetchRealDriveFolder(
           parsed.resourceId,
           Number(costPerSingleFileCredit) || 1,
-          Number(costPerGbCredit) || 1
+          Number(costPerGbCredit) || 1,
+          parsed.resourceKey
         );
         folderTitle = folderData.folderTitle;
         if (Array.isArray(selectedFileIds) && selectedFileIds.length > 0) {
@@ -1563,7 +1567,21 @@ app.use((req, res, next) => {
           if (originalStream.contentLength) {
             res.setHeader('Content-Length', originalStream.contentLength);
           }
-          originalStream.stream.pipe(res);
+          const stream = originalStream.stream;
+          stream.on('error', (streamErr) => {
+            console.warn('Stream error during file download:', streamErr);
+            if (!res.headersSent) {
+              res.status(502).end();
+            } else {
+              res.end();
+            }
+          });
+          res.on('close', () => {
+            if (typeof (stream as any).destroy === 'function') {
+              (stream as any).destroy();
+            }
+          });
+          stream.pipe(res);
           return;
         }
 
@@ -1683,6 +1701,14 @@ app.use((req, res, next) => {
       res.redirect(`https://drive.google.com/file/d/${encodeURIComponent(req.params.fileId)}/view`);
     }
   });
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception in server:', err);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled rejection in server:', reason);
+});
 
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {

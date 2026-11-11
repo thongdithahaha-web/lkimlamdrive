@@ -213,6 +213,7 @@ export function parseDriveUrl(rawUrl: string): {
   isValid: boolean;
   type: 'file' | 'folder' | 'unknown';
   resourceId: string;
+  resourceKey?: string;
   normalizedUrl: string;
 } {
   const trimmed = (rawUrl || '').trim();
@@ -220,9 +221,12 @@ export function parseDriveUrl(rawUrl: string): {
     return { isValid: false, type: 'unknown', resourceId: '', normalizedUrl: '' };
   }
 
+  const rkMatch = trimmed.match(/[?&]resourcekey=([a-zA-Z0-9_-]+)/i);
+  const resourceKey = rkMatch ? rkMatch[1] : undefined;
+
   // Match folder pattern
   const folderMatch =
-    trimmed.match(/\/drive\/(?:u\/\d+\/)?folders\/([a-zA-Z0-9_-]{8,})/) ||
+    trimmed.match(/\/drive\/(?:u\/\d+\/)?(?:mobile\/)?folders\/([a-zA-Z0-9_-]{8,})/) ||
     trimmed.match(/\/folders\/([a-zA-Z0-9_-]{8,})/);
   if (folderMatch) {
     const id = folderMatch[1];
@@ -230,33 +234,37 @@ export function parseDriveUrl(rawUrl: string): {
       isValid: true,
       type: 'folder',
       resourceId: id,
-      normalizedUrl: `https://drive.google.com/drive/folders/${id}`,
+      resourceKey,
+      normalizedUrl: `https://drive.google.com/drive/folders/${id}${resourceKey ? `?resourcekey=${resourceKey}` : ''}`,
     };
   }
 
-  // Match file pattern
+  // If URL ends with /folders or /folders/ without an ID, mark as invalid folder link
+  if (/\/folders\/?(?:[?#].*)?$/i.test(trimmed)) {
+    return {
+      isValid: false,
+      type: 'folder',
+      resourceId: '',
+      normalizedUrl: trimmed,
+    };
+  }
+
+  // Match file, presentation, document, or spreadsheet pattern
   const fileMatch =
-    trimmed.match(/\/file\/d\/([a-zA-Z0-9_-]{8,})/) ||
+    trimmed.match(/\/(?:file|presentation|document|spreadsheets)\/d\/([a-zA-Z0-9_-]{8,})/) ||
     trimmed.match(/[?&]id=([a-zA-Z0-9_-]{8,})/) ||
     trimmed.match(/drive\.google\.com\/open\?id=([a-zA-Z0-9_-]{8,})/);
   if (fileMatch) {
     const id = fileMatch[1];
+    const isFolderHint = trimmed.includes('folder');
     return {
       isValid: true,
-      type: 'file',
+      type: isFolderHint ? 'folder' : 'file',
       resourceId: id,
-      normalizedUrl: `https://drive.google.com/file/d/${id}/view`,
-    };
-  }
-
-  // Allow any URL containing drive.google.com or docs.google.com with a plausible ID
-  if (trimmed.includes('drive.google.com') || trimmed.includes('docs.google.com')) {
-    const fallbackId = trimmed.replace(/[^a-zA-Z0-9]/g, '').slice(-16) || 'drive_item_01';
-    return {
-      isValid: true,
-      type: trimmed.includes('folder') ? 'folder' : 'file',
-      resourceId: fallbackId,
-      normalizedUrl: trimmed,
+      resourceKey,
+      normalizedUrl: isFolderHint
+        ? `https://drive.google.com/drive/folders/${id}`
+        : `https://drive.google.com/file/d/${id}/view`,
     };
   }
 

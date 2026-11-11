@@ -113,7 +113,9 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
       setJobState({
         status: 'error',
         progress: 0,
-        message: 'Link Google Drive không hợp lệ. Vui lòng nhập đúng định dạng link Google Drive.',
+        message: driveUrl.includes('/folders')
+          ? 'Đường dẫn thư mục đang bị thiếu mã ID ở cuối (Ví dụ đúng: https://drive.google.com/drive/folders/1AbCdEf...). Hãy chuột phải vào thư mục -> Chia sẻ -> Sao chép đường liên kết!'
+          : 'Link Google Drive không hợp lệ. Vui lòng nhập đúng định dạng link Google Drive.',
       });
       return;
     }
@@ -163,7 +165,9 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
       setJobState({
         status: 'error',
         progress: 0,
-        message: 'Link Google Drive không hợp lệ. Vui lòng kiểm tra lại đường dẫn.',
+        message: driveUrl.includes('/folders')
+          ? 'Đường dẫn thư mục đang bị thiếu mã ID ở cuối (Ví dụ đúng: https://drive.google.com/drive/folders/1AbCdEf...). Hãy chuột phải vào thư mục -> Chia sẻ -> Sao chép đường liên kết!'
+          : 'Link Google Drive không hợp lệ. Vui lòng kiểm tra lại đường dẫn.',
       });
       return;
     }

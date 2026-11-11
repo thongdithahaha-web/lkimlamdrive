@@ -26,6 +26,7 @@ export async function fetchDriveFilesReal(
   userId?: string
 ): Promise<ListFilesApiResponse> {
   // 1. Primary path: call our Express backend /api/list-files
+  let backendError: Error | null = null;
   try {
     const res = await fetch('/api/list-files', {
       method: 'POST',
@@ -45,22 +46,31 @@ export async function fetchDriveFilesReal(
     if (contentType.includes('application/json')) {
       const data = await res.json();
       if (!res.ok) {
-        throw new Error(data.error || 'Không thể lấy danh sách file từ Google Drive');
+        backendError = new Error(data.error || 'Không thể lấy danh sách file từ Google Drive');
+        throw backendError;
       }
       if (data && Array.isArray(data.files) && data.files.length > 0) {
         return data as ListFilesApiResponse;
       }
     }
   } catch (err) {
+    if (backendError) {
+      throw backendError;
+    }
     if (err instanceof Error && err.message.includes('Google Drive')) {
       throw err;
     }
-    // Fallback to CORS proxy if backend route is unavailable
+    // Fallback to CORS proxy only if backend route is completely unreachable
   }
 
   // 2. Fallback path: fetch real Google Drive HTML via CORS relay
   const parsed = parseDriveUrl(driveUrl);
   if (!parsed.isValid) {
+    if (driveUrl.includes('/folders')) {
+      throw new Error(
+        'Đường dẫn thư mục đang bị thiếu mã ID ở cuối (Ví dụ đúng: https://drive.google.com/drive/folders/1AbCdEf...). Vui lòng sao chép đầy đủ link chia sẻ!'
+      );
+    }
     throw new Error('Link Google Drive không hợp lệ. Vui lòng kiểm tra lại đường dẫn.');
   }
 

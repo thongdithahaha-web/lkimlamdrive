@@ -75,9 +75,30 @@ export function extractDriveFolderFilesFromHtml(
   const files: DriveFileItem[] = [];
   const seenIds = new Set<string>();
 
-  // 1. Parse from embeddedfolderview (#list)
+  const lookupSizeInMainHtml = (id: string, contextHtml: string): string => {
+    const escapedId = id.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
+    const cellRegex = new RegExp(
+      `ssk=['"][^'"]*${escapedId}-0-1['"]><span class="WQJtxb"[^>]*>([^<]+)<\\/span>`,
+      'i'
+    );
+    const cellMatch = contextHtml.match(cellRegex) || mainHtml.match(cellRegex);
+    if (cellMatch && cellMatch[1]) {
+      return decodeHtmlEntities(cellMatch[1].trim());
+    }
+    const ariaRegex = new RegExp(
+      `aria-label="(?:Size|Kích cỡ|Kích thước):\\s*([^"]+?)\\s*(?:Storage|Bộ nhớ|$)"[^>]*ssk=['"][^'"]*${escapedId}`,
+      'i'
+    );
+    const ariaMatch = contextHtml.match(ariaRegex) || mainHtml.match(ariaRegex);
+    if (ariaMatch && ariaMatch[1]) {
+      return decodeHtmlEntities(ariaMatch[1].trim());
+    }
+    return '';
+  };
+
+  // 1. Parse from embeddedfolderview (#list or #grid)
   const entryRegex =
-    /<div class="flip-entry" id="entry-([^"]+)"[\s\S]*?<a href="([^"]+)"[\s\S]*?<div class="flip-entry-title">([^<]+)<\/div>/g;
+    /<div[^>]*class="[^"]*flip-entry[^"]*"[^>]*id="entry-([^"]+)"[\s\S]*?<a[^>]*href="([^"]+)"[\s\S]*?<div[^>]*class="[^"]*flip-entry-title[^"]*"[^>]*>([^<]+)<\/div>/gi;
   let match: RegExpExecArray | null;
 
   while ((match = entryRegex.exec(embedHtml)) !== null) {
@@ -86,28 +107,7 @@ export function extractDriveFolderFilesFromHtml(
     seenIds.add(id);
 
     const name = decodeHtmlEntities(rawTitle.trim());
-    const escapedId = id.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
-
-    // Look up size in mainHtml table cells associated with this file ID
-    let sizeFormatted = '';
-    const cellRegex = new RegExp(
-      `ssk='[^']*${escapedId}-0-1'><span class="WQJtxb"[^>]*>([^<]+)<\\/span>`,
-      'i'
-    );
-    const cellMatch = mainHtml.match(cellRegex);
-    if (cellMatch && cellMatch[1]) {
-      sizeFormatted = decodeHtmlEntities(cellMatch[1].trim());
-    } else {
-      const ariaRegex = new RegExp(
-        `aria-label="(?:Size|Kích cỡ|Kích thước):\\s*([^"]+?)\\s*(?:Storage|Bộ nhớ|$)"[^>]*ssk='[^']*${escapedId}`,
-        'i'
-      );
-      const ariaMatch = mainHtml.match(ariaRegex);
-      if (ariaMatch && ariaMatch[1]) {
-        sizeFormatted = decodeHtmlEntities(ariaMatch[1].trim());
-      }
-    }
-
+    const sizeFormatted = lookupSizeInMainHtml(id, mainHtml);
     const sizeBytes = parseSizeToBytes(sizeFormatted);
     const credits = computeFileCredits(sizeBytes, costPerSingleFileCredit, costPerGbCredit);
     const isSubFolder = href.includes('/folders/');
@@ -122,33 +122,98 @@ export function extractDriveFolderFilesFromHtml(
     });
   }
 
-  // 2. Fallback: If embeddedfolderview returned 0 entries, parse rows from mainHtml
+  // 2. Fallback: Parse table rows or data-id blocks from mainHtml
   if (files.length === 0 && mainHtml) {
     const rowRegex =
-      /<tr[^>]*data-id="([^"]+)"[\s\S]*?<strong class="DNoYtb">([^<]+)<\/strong>[\s\S]*?<\/tr>/g;
+      /<tr[^>]*data-id="([^"]+)"[\s\S]*?<strong class="DNoYtb">([^<]+)<\/strong>[\s\S]*?<\/tr>/gi;
     let rowMatch: RegExpExecArray | null;
     while ((rowMatch = rowRegex.exec(mainHtml)) !== null) {
       const [fullRow, id, rawTitle] = rowMatch;
-      if (!id || seenIds.has(id)) continue;
+      if (!id || id.startsWith('_') || seenIds.has(id)) continue;
       seenIds.add(id);
 
       const name = decodeHtmlEntities(rawTitle.trim());
-      const escapedId = id.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
-      const sizeCellRegex = new RegExp(
-        `ssk='[^']*${escapedId}-0-1'><span class="WQJtxb"[^>]*>([^<]+)<\\/span>`,
-        'i'
-      );
-      const sMatch = fullRow.match(sizeCellRegex);
-      const sizeFormatted = sMatch ? decodeHtmlEntities(sMatch[1].trim()) : 'Tệp Drive';
+      const sizeFormatted = lookupSizeInMainHtml(id, fullRow) || 'Tệp Drive';
       const sizeBytes = parseSizeToBytes(sizeFormatted);
+      const credits = computeFileCredits(sizeBytes, costPerSingleFileCredit, costPerGbCredit);
+      const isSubFolder =
+        fullRow.includes('application/vnd.google-apps.folder') ||
+        (!name.includes('.') && sizeFormatted === 'Tệp Drive');
+
+      files.push({
+        id,
+        name,
+        sizeBytes,
+        sizeFormatted: isSubFolder && sizeBytes === 0 ? 'Thư mục' : sizeFormatted,
+        mimeType: isSubFolder ? 'application/vnd.google-apps.folder' : guessMimeType(name),
+        credits,
+      });
+    }
+  }
+
+  // 3. Fallback: Parse modern Google Drive data-id cards/rows with KL4NAf or data-tooltip
+  if (files.length === 0 && mainHtml) {
+    const dataIdRegex =
+      /data-id="([a-zA-Z0-9_-]{15,})"[\s\S]{1,1500}?(?:<div[^>]*class="[^"]*KL4NAf[^"]*"[^>]*><span[^>]*>([^<]+)<\/span>|data-tooltip="(?:[^"]*?:\s*)?([^"]+)")/gi;
+    let dMatch: RegExpExecArray | null;
+    while ((dMatch = dataIdRegex.exec(mainHtml)) !== null) {
+      const id = dMatch[1];
+      const rawTitle = dMatch[2] || dMatch[3];
+      if (!id || !rawTitle || id.startsWith('_') || seenIds.has(id)) continue;
+      seenIds.add(id);
+
+      const name = decodeHtmlEntities(rawTitle.trim());
+      const sizeFormatted = lookupSizeInMainHtml(id, mainHtml);
+      const sizeBytes = parseSizeToBytes(sizeFormatted);
+      const credits = computeFileCredits(sizeBytes, costPerSingleFileCredit, costPerGbCredit);
+      const isSubFolder = !name.includes('.') && sizeBytes === 0;
+
+      files.push({
+        id,
+        name,
+        sizeBytes,
+        sizeFormatted: sizeFormatted || (isSubFolder ? 'Thư mục' : 'Tệp Drive'),
+        mimeType: isSubFolder ? 'application/vnd.google-apps.folder' : guessMimeType(name),
+        credits,
+      });
+    }
+  }
+
+  // 4. Fallback: Parse Google Drive _drive_ivd / AF_initDataCallback escaped JSON payload
+  if (files.length === 0 && mainHtml) {
+    const unescaped = mainHtml
+      .replace(/\\x22/g, '"')
+      .replace(/\\x5b/g, '[')
+      .replace(/\\x5d/g, ']')
+      .replace(/\\u0026/g, '&')
+      .replace(/\\\//g, '/');
+
+    const ivdRegex =
+      /\["([a-zA-Z0-9_-]{15,})",\["[a-zA-Z0-9_-]{10,}"\],"([^"\\]*(?:\\.[^"\\]*)*)","([^"]+)"/g;
+    let ivdMatch: RegExpExecArray | null;
+    while ((ivdMatch = ivdRegex.exec(unescaped)) !== null) {
+      const [, id, rawName, mime] = ivdMatch;
+      if (!id || seenIds.has(id)) continue;
+      seenIds.add(id);
+
+      let name = rawName;
+      try {
+        name = JSON.parse(`"${rawName.replace(/"/g, '\\"')}"`);
+      } catch {
+        name = decodeHtmlEntities(rawName);
+      }
+
+      const sizeFormatted = lookupSizeInMainHtml(id, mainHtml);
+      const sizeBytes = parseSizeToBytes(sizeFormatted);
+      const isSubFolder = mime === 'application/vnd.google-apps.folder';
       const credits = computeFileCredits(sizeBytes, costPerSingleFileCredit, costPerGbCredit);
 
       files.push({
         id,
         name,
         sizeBytes,
-        sizeFormatted,
-        mimeType: guessMimeType(name),
+        sizeFormatted: sizeFormatted || (isSubFolder ? 'Thư mục' : 'Tệp Drive'),
+        mimeType: isSubFolder ? 'application/vnd.google-apps.folder' : mime || guessMimeType(name),
         credits,
       });
     }
@@ -249,16 +314,21 @@ export async function fetchRealSingleDriveFile(
 export async function fetchRealDriveFolder(
   folderId: string,
   costPerSingleFileCredit = 1,
-  costPerGbCredit = 1
+  costPerGbCredit = 1,
+  resourceKey?: string,
+  depth = 0
 ): Promise<{ folderTitle: string; files: DriveFileItem[] }> {
+  const rkParamEmbed = resourceKey ? `&resourcekey=${encodeURIComponent(resourceKey)}` : '';
+  const rkParamMain = resourceKey ? `&resourcekey=${encodeURIComponent(resourceKey)}` : '';
+
   const [embedRes, mainRes] = await Promise.all([
-    fetch(`https://drive.google.com/embeddedfolderview?id=${folderId}#list`, {
+    fetch(`https://drive.google.com/embeddedfolderview?id=${encodeURIComponent(folderId)}${rkParamEmbed}#list`, {
       headers: {
         'User-Agent': CHROME_UA,
         'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
       },
     }),
-    fetch(`https://drive.google.com/drive/folders/${folderId}?hl=vi`, {
+    fetch(`https://drive.google.com/drive/folders/${encodeURIComponent(folderId)}?hl=vi${rkParamMain}`, {
       headers: {
         'User-Agent': CHROME_UA,
         'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
@@ -276,8 +346,45 @@ export async function fetchRealDriveFolder(
     costPerGbCredit
   );
 
-  // If any file did not have size in mainHtml, enrich up to 8 files via preview endpoint
-  const missingSizeFiles = parsed.files.filter((f) => f.sizeBytes === 0).slice(0, 8);
+  // If this parent folder contains subfolders (e.g. UNIT 1, UNIT 2, UNIT 3...), crawl up to 6 subfolders at depth 0
+  // so the user immediately sees all files inside nested folders too.
+  if (depth === 0 && parsed.files.length > 0) {
+    const subFolders = parsed.files.filter((f) => f.mimeType === 'application/vnd.google-apps.folder');
+    const directFiles = parsed.files.filter((f) => f.mimeType !== 'application/vnd.google-apps.folder');
+
+    if (subFolders.length > 0 && directFiles.length === 0) {
+      const crawledSubFolders = await Promise.all(
+        subFolders.slice(0, 6).map(async (sf) => {
+          try {
+            const subResult = await fetchRealDriveFolder(
+              sf.id,
+              costPerSingleFileCredit,
+              costPerGbCredit,
+               undefined,
+              depth + 1
+            );
+            return subResult.files
+              .filter((child) => child.mimeType !== 'application/vnd.google-apps.folder')
+              .map((child) => ({
+                ...child,
+                name: `[${sf.name}] ${child.name}`,
+              }));
+          } catch {
+            return [];
+          }
+        })
+      );
+      const flattened = crawledSubFolders.flat();
+      if (flattened.length > 0) {
+        parsed.files = [...flattened, ...subFolders];
+      }
+    }
+  }
+
+  // If any file (not folder) did not have size in mainHtml, enrich up to 8 files via preview endpoint
+  const missingSizeFiles = parsed.files
+    .filter((f) => f.sizeBytes === 0 && f.mimeType !== 'application/vnd.google-apps.folder')
+    .slice(0, 8);
   if (missingSizeFiles.length > 0) {
     await Promise.all(
       missingSizeFiles.map(async (f) => {
